@@ -1,0 +1,34 @@
+# 1. Python Virtual Environment 
+Faceenv/
+
+# 2. Python Cache & Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 3. Direktori Data Sensitif (Wajah & Embedding)
+# Kita abaikan isinya, tapi tetap pertahankan foldernya
+samples/*
+!samples/.gitkeep
+samples_embedding/*
+!samples_embedding/.gitkeep
+
+# 4. Folder Editor / IDE & AI Agents
+.vscode/
+.vs/
+.qoder/
+.agents/
+
+# 5. File Temporary & Log
+temp/
+*.log
+
+# 6. Variabel Lingkungan / Database (Jika ada)
+.env
+*.db
+*.sqlite3
+
+# 7. OS Generated Files
+.DS_Store
+Thumbs.db

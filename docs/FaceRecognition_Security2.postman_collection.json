@@ -1,0 +1,149 @@
+{
+	"info": {
+		"_postman_id": "812fcf44-4c77-4c66-96a8-6e3c72bc443c",
+		"name": "FaceRecognition_Security2",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "43186033"
+	},
+	"item": [
+		{
+			"name": "Login",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"let jsonData = pm.response.json();\r",
+							"pm.environment.set(\"token\", jsonData.access_token);"
+						],
+						"type": "text/javascript",
+						"packages": {}
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "urlencoded",
+					"urlencoded": [
+						{
+							"key": "username",
+							"value": "admin",
+							"type": "text"
+						},
+						{
+							"key": "password",
+							"value": "anakmagangdariumn",
+							"type": "text"
+						}
+					]
+				},
+				"url": {
+					"raw": "http://127.0.0.1:5000/api/login",
+					"protocol": "http",
+					"host": [
+						"127",
+						"0",
+						"0",
+						"1"
+					],
+					"port": "5000",
+					"path": [
+						"api",
+						"login"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Register (Tambah Data)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{token}}",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{
+							"key": "photos",
+							"type": "file",
+							"src": [
+								"postman-cloud:///1f0352fb-0733-4280-b477-ea36e30e8055",
+								"postman-cloud:///1f031352-c319-4500-8ce9-51d30e0bb1a8",
+								"postman-cloud:///1f031353-6f85-4f00-9e79-ef84c8b9fb99",
+								"postman-cloud:///1f031351-59bb-48c0-b5c6-e98767e599a5",
+								"postman-cloud:///1f005361-5993-43a0-bd44-25610355ccee"
+							]
+						},
+						{
+							"key": "nip",
+							"value": "111111",
+							"type": "text"
+						},
+						{
+							"key": "name",
+							"value": "coba",
+							"type": "text"
+						}
+					]
+				},
+				"url": {
+					"raw": "http://127.0.0.1:5000/api/register",
+					"protocol": "http",
+					"host": [
+						"127",
+						"0",
+						"0",
+						"1"
+					],
+					"port": "5000",
+					"path": [
+						"api",
+						"register"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Predict",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{
+							"key": "photo",
+							"type": "file",
+							"src": "postman-cloud:///1f031352-c319-4500-8ce9-51d30e0bb1a8"
+						}
+					]
+				},
+				"url": {
+					"raw": "http://127.0.0.1:5000/api/predict",
+					"protocol": "http",
+					"host": [
+						"127",
+						"0",
+						"0",
+						"1"
+					],
+					"port": "5000",
+					"path": [
+						"api",
+						"predict"
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}
