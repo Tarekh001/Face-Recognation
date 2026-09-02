@@ -433,9 +433,14 @@ def predict():
                 print(f"   ↳ Dikenali tapi di luar jam presensi ({jam_masuk_mulai.strftime('%H:%M')}-{jam_masuk_akhir.strftime('%H:%M')} / {jam_keluar_mulai.strftime('%H:%M')}-{jam_keluar_akhir.strftime('%H:%M')})\n")
                 return jsonify({"message": f"Maaf {user.nama_lengkap}, sekarang bukan jam presensi ASN."}), 403
 
-            # 2. Validasi: Cek apakah ASN sudah absen hari ini
+            # ── Attendance identifier: use AI-recognized NIP/NIK (best_nip) directly ──
+            # best_nip is ALWAYS populated here — it came from the face embedding match.
+            # This avoids NULL issues from user.pin (Non-ASN) or FK-nullified user.nip.
+            attendance_id = best_nip
+
+            # 2. Validasi: Cek apakah user sudah absen hari ini
             existing_log = Presensi.query.filter(
-                Presensi.user_pin == user.pin,
+                Presensi.user_pin == attendance_id,
                 db.func.date(Presensi.waktu_scan) == today,
                 Presensi.tipe_absen == status_absen
             ).first()
@@ -457,7 +462,7 @@ def predict():
 
             # 4. Simpan ke Database
             new_log = Presensi(
-                user_pin=user.pin,
+                user_pin=attendance_id,
                 device_sn=device_klien_sn,
                 waktu_scan=now,
                 tipe_absen=status_absen,
@@ -470,7 +475,7 @@ def predict():
             late_info = f" | Terlambat: {keterlambatan_menit} menit" if status_kehadiran == "LATE" else ""
             sync_tag = " [OFFLINE-SYNC]" if is_offline_sync else ""
             print(f"\n🟢 [FACE-AI]{sync_tag} MATCH: {best_name} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Status: {status_absen} | {status_kehadiran}{late_info}")
-            print(f"   ↳ Waktu: {now.strftime('%H:%M:%S')} | Device: {device_klien_sn}\n")
+            print(f"   ↳ Waktu: {now.strftime('%H:%M:%S')} | Device: {device_klien_sn} | AttendanceID: {attendance_id}\n")
             
             return jsonify({
                 "nip": best_nip,
@@ -661,7 +666,10 @@ def get_report(current_user):
         
     # Filter by role (ASN / Non-ASN)
     if role_filter:
-        presensi_q = presensi_q.join(User, Presensi.user_pin == User.pin).filter(User.role == role_filter)
+        presensi_q = presensi_q.join(
+            User,
+            db.or_(Presensi.user_pin == User.nip, Presensi.user_pin == User.pin)
+        ).filter(User.role == role_filter)
         
     if current_user.role == 'admin_opd':
         opd_device_sns = [d.sn for d in Device.query.filter_by(opd_id=current_user.opd_id).all()]
@@ -676,19 +684,19 @@ def get_report(current_user):
     # STEP 2: Resolve identity via data_pegawai (LEFT JOIN fallback)
     #         data_pegawai is the source of truth for NIP & nama
     # ────────────────────────────────────────────────────────
-    unique_pins = set(log.user_pin for log in all_logs)
+    unique_ids = set(log.user_pin for log in all_logs if log.user_pin)
     pin_identity = {}
-    for pin in unique_pins:
-        pegawai = DataPegawai.query.filter_by(pin=pin).first()
+    for uid in unique_ids:
+        # user_pin now stores NIP/NIK (from /predict's best_nip). Try nip first, then pin.
+        user = User.query.filter_by(nip=uid).first() or User.query.filter_by(pin=uid).first()
+        user_role = user.role if user else 'asn'
+        pegawai = DataPegawai.query.filter_by(nip=uid).first() or DataPegawai.query.filter_by(pin=uid).first()
         if pegawai:
-            pin_identity[pin] = {"nip": pegawai.nip, "nama": pegawai.nama_lengkap}
+            pin_identity[uid] = {"nip": pegawai.nip, "nama": pegawai.nama_lengkap, "role": user_role}
+        elif user:
+            pin_identity[uid] = {"nip": user.nip or uid, "nama": user.nama_lengkap, "role": user_role}
         else:
-            # Fallback: try users table
-            user = User.query.filter_by(pin=pin).first()
-            if user:
-                pin_identity[pin] = {"nip": user.nip or pin, "nama": user.nama_lengkap}
-            else:
-                pin_identity[pin] = {"nip": pin, "nama": f"Unknown ({pin})"}
+            pin_identity[uid] = {"nip": uid, "nama": f"Unknown ({uid})", "role": "asn"}
 
     # ────────────────────────────────────────────────────────
     # STEP 3: Index logs by (pin, date) and group IN/OUT
@@ -717,6 +725,7 @@ def get_report(current_user):
         report_data.append({
             "nip": identity["nip"],
             "nama": identity["nama"],
+            "role": identity.get("role", "asn"),
             "tanggal": log_date.strftime("%Y-%m-%d"),
             "jam_masuk": earliest_in.waktu_scan.strftime("%H:%M:%S") if earliest_in else None,
             "status_masuk": earliest_in.status_kehadiran if earliest_in else None,
@@ -745,10 +754,13 @@ def get_report(current_user):
     # STEP 4: Generate virtual ABSENT rows for ALL users
     #         (Admin + ASN — anyone who should be present)
     # ────────────────────────────────────────────────────────
+    known_users_q = User.query
     if current_user.role == 'admin_opd':
-        known_users = User.query.filter_by(opd_id=current_user.opd_id).all()
-    else:
-        known_users = User.query.all()
+        known_users_q = known_users_q.filter_by(opd_id=current_user.opd_id)
+    # ── Apply role filter to ABSENT generator too ──
+    if role_filter:
+        known_users_q = known_users_q.filter(User.role == role_filter)
+    known_users = known_users_q.all()
 
     # SECURITY FIX: When kegiatan_id is set, intersect enrolled NIPs with OPD scope
     # Ensures: "employees in enrolled_nips AND whose opd_id equals Admin's opd_id"
@@ -779,13 +791,17 @@ def get_report(current_user):
 
         if not is_holiday and current_date <= today:
             for u in known_users:
-                if (u.pin, current_date) not in existing_keys:
-                    identity = pin_identity.get(u.pin)
+                attendance_id = u.nip if u.nip else u.pin
+                if not attendance_id:
+                    continue
+                if (attendance_id, current_date) not in existing_keys:
+                    identity = pin_identity.get(attendance_id)
                     if not identity:
-                        identity = {"nip": u.nip or u.pin, "nama": u.nama_lengkap}
+                        identity = {"nip": u.nip or attendance_id, "nama": u.nama_lengkap}
                     report_data.append({
                         "nip": identity["nip"],
                         "nama": identity["nama"],
+                        "role": u.role,
                         "tanggal": current_date.strftime("%Y-%m-%d"),
                         "jam_masuk": None,
                         "status_masuk": "ABSENT",
@@ -870,9 +886,12 @@ def get_manage_asn(current_user):
 
     data_asn = []
     for user in users:
+        # ── Attendance identifier: NIP is always set by registration (ASN=18digit, Non-ASN=16digit NIK) ──
+        attendance_id = user.nip if user.nip else user.pin
+
         # ── Status Kehadiran Hari Ini ──
         logs_today = Presensi.query.filter(
-            Presensi.user_pin == user.pin,
+            Presensi.user_pin == attendance_id,
             db.func.date(Presensi.waktu_scan) == today
         ).all()
 
@@ -958,9 +977,25 @@ def revoke_cross_opd(current_user, akses_id):
 def get_settings(current_user):
     if current_user.role != 'super_admin':
         return jsonify({"error": "Hanya Super Admin yang dapat mengakses pengaturan."}), 403
+
+    defaults = {
+        'JAM_MASUK_MULAI': ('06:00:00', 'Kiosk mulai menerima scan masuk'),
+        'BATAS_TERLAMBAT': ('08:00:00', 'Lewat jam ini dianggap TERLAMBAT'),
+        'JAM_MASUK_AKHIR': ('12:00:00', 'Kiosk berhenti menerima scan masuk'),
+        'JAM_KELUAR_MULAI': ('15:00:00', 'Kiosk mulai menerima scan pulang'),
+        'JAM_KELUAR_AKHIR': ('20:00:00', 'Kiosk berhenti menerima scan pulang'),
+    }
+
+    # Auto-seed missing default keys
+    for k, (val, desc) in defaults.items():
+        if not AppSetting.query.get(k):
+            db.session.add(AppSetting(setting_key=k, setting_value=val, description=desc))
+    db.session.commit()
+
     rows = AppSetting.query.all()
     return jsonify([{
-        "key": r.setting_key, "value": r.setting_value,
+        "key": r.setting_key,
+        "value": r.setting_value,
         "description": r.description,
         "updated_at": r.updated_at.strftime("%Y-%m-%d %H:%M:%S") if r.updated_at else None
     } for r in rows]), 200
@@ -979,7 +1014,10 @@ def update_settings(current_user):
         row = AppSetting.query.get(key)
         if row:
             row.setting_value = str(value)
-            updated.append(key)
+        else:
+            row = AppSetting(setting_key=key, setting_value=str(value))
+            db.session.add(row)
+        updated.append(key)
     db.session.commit()
     return jsonify({"message": f"{len(updated)} pengaturan berhasil diperbarui.", "updated_keys": updated}), 200
 

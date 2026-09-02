@@ -128,7 +128,7 @@ class AuditLog(db.Model):
 class Presensi(db.Model):
     __tablename__ = 'presensi'
     log_id = db.Column(db.BigInteger, Sequence('presensi_log_id_seq'), primary_key=True, autoincrement=True)
-    user_pin = db.Column(db.String(50), nullable=False, index=True) 
+    user_pin = db.Column(db.String(50), nullable=True, index=True)  # Nullable: Non-ASN uses NIP as fallback
     device_sn = db.Column(db.String(50), nullable=False, default='WEB_APP') 
     waktu_scan = db.Column('waktu_presensi', db.DateTime, primary_key=True, default=get_wib_time) 
     tipe_absen = db.Column(db.String(10), nullable=False) 

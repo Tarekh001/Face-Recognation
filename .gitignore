@@ -19,6 +19,9 @@ samples_embedding/*
 .vs/
 .qoder/
 .agents/
+.tools/
+.docs/
+migrations/
 
 # 5. File Temporary & Log
 temp/
