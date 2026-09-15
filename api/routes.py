@@ -1567,8 +1567,22 @@ def public_opd_list():
 @token_required
 def manage_opd(current_user):
     if request.method == 'GET':
-        if current_user.role == 'super_admin': opds = MasterOpd.query.all()
-        else: opds = MasterOpd.query.filter_by(id=current_user.opd_id).all()
+        scope = request.args.get('scope', '').lower()
+
+        # scope=global: return ALL OPDs (safe fields only) for invitation dropdowns
+        if scope == 'global':
+            opds = MasterOpd.query.order_by(MasterOpd.nama_opd).all()
+            return jsonify([{
+                "id": o.id,
+                "nama_opd": o.nama_opd,
+                "kode_opd": o.kode_opd
+            } for o in opds]), 200
+
+        # Default: existing RBAC filter
+        if current_user.role == 'super_admin':
+            opds = MasterOpd.query.all()
+        else:
+            opds = MasterOpd.query.filter_by(id=current_user.opd_id).all()
         return jsonify([{"id": o.id, "nama": o.nama_opd, "kode": o.kode_opd} for o in opds]), 200
         
     if request.method == 'POST':
