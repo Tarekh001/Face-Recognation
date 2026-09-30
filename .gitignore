@@ -29,6 +29,7 @@ temp/
 
 # 6. Variabel Lingkungan / Database (Jika ada)
 .env
+.env.server
 *.db
 *.sqlite3
 
