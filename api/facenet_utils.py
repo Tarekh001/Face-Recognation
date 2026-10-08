@@ -1,4 +1,5 @@
 import os
+import cv2
 import numpy as np
 import pickle
 from keras_facenet import FaceNet
@@ -20,43 +21,74 @@ print("✅ [INIT] FaceNet + MTCNN Face Detector berhasil dimuat.")
 # ============================================
 def detect_and_crop_face(image_path, target_size=(160, 160)):
     """
-    Mendeteksi wajah menggunakan MTCNN, crop area wajah,
-    lalu resize ke ukuran yang dibutuhkan FaceNet (160x160).
-    Mengembalikan numpy array siap prediksi, atau None jika tidak ada wajah.
+    Mendeteksi wajah menggunakan MTCNN dengan multi-rotation fallback (0°, 90°, 270°, 180°),
+    crop area wajah dengan padding 20%, lalu resize ke ukuran yang dibutuhkan FaceNet (160x160).
+    Jika MTCNN tidak menemukan landmark pada foto yang sudah di-crop,
+    menggunakan fallback pre-crop resize langsung agar tidak menghasilkan error 500.
     """
     try:
         img = Image.open(image_path).convert('RGB')
-        # Fix EXIF orientation (penting untuk foto dari HP Android/iOS)
+        # Fix EXIF orientation (penting untuk foto dari HP Android/iOS/Tablet)
         img = ImageOps.exif_transpose(img)
-        img_array = np.array(img)
+        img_rgb = np.array(img)
 
-        # Deteksi semua wajah di gambar
-        results = detector.detect_faces(img_array)
+        # 1. Coba deteksi orientasi asli (0°)
+        results = detector.detect_faces(img_rgb)
+        active_rgb = img_rgb
+        detected_rot = 0
 
+        # 2. Multi-rotation fallback jika di 0° tidak ada wajah (kamera tablet / sensor landscape)
         if not results:
-            return None  # Tidak ada wajah terdeteksi
+            rotations = [
+                (cv2.ROTATE_90_CLOCKWISE, 90),
+                (cv2.ROTATE_90_COUNTERCLOCKWISE, 270),
+                (cv2.ROTATE_180, 180),
+            ]
+            for rot_code, angle in rotations:
+                cand_rgb = cv2.rotate(img_rgb, rot_code)
+                cand_results = detector.detect_faces(cand_rgb)
+                if cand_results:
+                    results = cand_results
+                    active_rgb = cand_rgb
+                    detected_rot = angle
+                    print(f"   🔄 [FaceNet] Wajah terdeteksi via rotasi fallback: {angle}°")
+                    break
 
-        # Ambil wajah dengan confidence tertinggi
-        best_face = max(results, key=lambda x: x['confidence'])
-        x, y, w, h = best_face['box']
+        # 3. Jika MTCNN berhasil menemukan wajah:
+        if results:
+            best_face = max(results, key=lambda x: x['confidence'])
+            x, y, w, h = best_face['box']
+            conf = best_face['confidence']
 
-        # Padding 15% untuk margin agar tidak terlalu tight crop
-        pad_w = int(w * 0.15)
-        pad_h = int(h * 0.15)
-        x1 = max(0, x - pad_w)
-        y1 = max(0, y - pad_h)
-        x2 = min(img_array.shape[1], x + w + pad_w)
-        y2 = min(img_array.shape[0], y + h + pad_h)
+            # Padding 20% proporsional untuk margin (agar fitur lengkap masuk ke FaceNet)
+            pad_w = int(w * 0.20)
+            pad_h = int(h * 0.20)
+            ih, iw = active_rgb.shape[:2]
+            x1 = max(0, x - pad_w)
+            y1 = max(0, y - pad_h)
+            x2 = min(iw, x + w + pad_w)
+            y2 = min(ih, y + h + pad_h)
 
-        # Crop wajah dari gambar asli
-        face_crop = img.crop((x1, y1, x2, y2))
-        face_crop = face_crop.resize(target_size, Image.LANCZOS)
+            crop_np = active_rgb[y1:y2, x1:x2]
+            if crop_np.size > 0:
+                face_crop = Image.fromarray(crop_np).resize(target_size, Image.LANCZOS)
+                face_array = np.array(face_crop, dtype='float32')
+                face_array = (face_array - 127.5) / 128.0
+                print(f"   ✅ [FaceNet] MTCNN OK (rot: {detected_rot}°, conf: {conf:.3f}, box: [{x},{y},{w},{h}])")
+                return np.expand_dims(face_array, axis=0)
 
-        # Normalisasi pixel untuk FaceNet (standar: (pixel - 127.5) / 128.0)
-        face_array = np.array(face_crop, dtype='float32')
-        face_array = (face_array - 127.5) / 128.0
+        # 4. Fallback jika MTCNN gagal tapi gambar sudah berupa foto wajah pre-cropped
+        ih, iw = img_rgb.shape[:2]
+        aspect = iw / max(ih, 1)
+        if 0.60 <= aspect <= 1.60 and min(iw, ih) >= 80:
+            print(f"   ℹ️ [FaceNet] MTCNN no-landmark, fallback direct crop ({iw}x{ih})")
+            face_crop = img.resize(target_size, Image.LANCZOS)
+            face_array = np.array(face_crop, dtype='float32')
+            face_array = (face_array - 127.5) / 128.0
+            return np.expand_dims(face_array, axis=0)
 
-        return np.expand_dims(face_array, axis=0)
+        print(f"   ⚠️ [FaceNet] Tidak ada wajah terdeteksi di {os.path.basename(image_path)} (dim: {iw}x{ih})")
+        return None
 
     except Exception as e:
         print(f"   ❌ Error saat deteksi wajah: {e}")

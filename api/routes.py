@@ -439,14 +439,11 @@ def predict():
             elif jam_keluar_mulai <= ct < jam_keluar_akhir:
                 status_absen = "OUT"
             else:
-                print(f"\n🟡 [FACE-AI] OUT OF HOURS: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Waktu: {now.strftime('%H:%M:%S')}")
-                print(f"   ↳ Dikenali tapi di luar jam presensi ({jam_masuk_mulai.strftime('%H:%M')}-{jam_masuk_akhir.strftime('%H:%M')} / {jam_keluar_mulai.strftime('%H:%M')}-{jam_keluar_akhir.strftime('%H:%M')})\n")
-                return jsonify({"message": f"Maaf {user.nama_lengkap}, sekarang bukan jam presensi ASN."}), 403
-                # # ── BYPASS SEMENTARA: Hilangkan batasan range waktu presensi ──
-                # # Mengizinkan presensi kapan saja saat masa pengujian/demo.
-                # # Sebelum jam 13:00 dialokasikan 'IN', setelah jam 13:00 dialokasikan 'OUT'.
-                # status_absen = "IN" if ct < time_type(13, 0) else "OUT"
-                # print(f"\nℹ️ [FACE-AI] Bypass Range Waktu: {user.nama_lengkap} (NIP: {best_nip}) otomatis dialokasikan '{status_absen}' (Waktu: {now.strftime('%H:%M:%S')})")
+                # ── BYPASS SEMENTARA: Hilangkan batasan range waktu presensi untuk testing ──
+                # Mengizinkan presensi kapan saja saat masa pengujian/demo.
+                # Sebelum jam 13:00 dialokasikan 'IN', setelah jam 13:00 dialokasikan 'OUT'.
+                status_absen = "IN" if ct < time_type(13, 0) else "OUT"
+                print(f"\nℹ️ [FACE-AI] Bypass Range Waktu: {user.nama_lengkap} (NIP: {best_nip}) otomatis dialokasikan '{status_absen}' (Waktu: {now.strftime('%H:%M:%S')})")
 
             # ── Attendance identifier: use AI-recognized NIP/NIK (best_nip) directly ──
             # best_nip is ALWAYS populated here — it came from the face embedding match.
