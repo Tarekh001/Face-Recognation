@@ -7,6 +7,8 @@ from mtcnn import MTCNN
 from PIL import Image, ImageOps
 from scipy.spatial.distance import cosine
 
+import threading
+
 # ============================================
 # INISIALISASI MODEL (Satu kali saat startup)
 # ============================================
@@ -17,84 +19,180 @@ detector = MTCNN()
 print("✅ [INIT] FaceNet + MTCNN Face Detector berhasil dimuat.")
 
 # ============================================
-# ============================================
 # FACE DETECTION & ALIGNMENT (MTCNN)
 # ============================================
-def _filter_best_real_face(results, min_size=55):
+def _is_upright_face(face):
+    """
+    Memeriksa apakah deteksi wajah dalam orientasi tegak (mata di atas mulut).
+    MTCNN keypoints: left_eye, right_eye, nose, mouth_left, mouth_right.
+    """
+    if not face or 'keypoints' not in face:
+        return True
+    kp = face['keypoints']
+    eye_y = (kp['left_eye'][1] + kp['right_eye'][1]) / 2.0
+    mouth_y = (kp['mouth_left'][1] + kp['mouth_right'][1]) / 2.0
+    # Pada orientasi tegak normal, mata HARUS berada di atas mulut (y mata < y mulut)
+    if eye_y >= mouth_y:
+        return False
+    # Jarak horizontal mata harus lebih besar dari perbedaan vertikal
+    dx = abs(kp['right_eye'][0] - kp['left_eye'][0])
+    dy = abs(kp['right_eye'][1] - kp['left_eye'][1])
+    if dx < dy * 0.7:
+        return False
+    return True
+
+
+def _filter_best_real_face(results, min_size=45, require_upright=True):
     """
     Menyaring deteksi wajah MTCNN untuk mengabaikan noise/speck kecil (< min_size px).
-    Wajah asli manusia pada foto presensi/selfie selalu berukuran minimal 55x55 px.
-    Mengembalikan wajah dengan luas area terbesar dan confidence tertinggi.
+    Hanya mengembalikan wajah valid berukuran cukup dan orientasi tegak (jika require_upright).
+    Mengutamakan confidence terlebih dahulu, lalu area.
     """
     if not results:
         return None
     valid = [f for f in results if f['box'][2] >= min_size and f['box'][3] >= min_size]
+    if require_upright:
+        upright = [f for f in valid if _is_upright_face(f)]
+        if upright:
+            valid = upright
     if not valid:
         return None
-    return max(valid, key=lambda f: (f['box'][2] * f['box'][3], f['confidence']))
+    return max(valid, key=lambda f: (f['confidence'], f['box'][2] * f['box'][3]))
 
 
-def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False):
+def align_and_square_crop(img_rgb, face, target_size=(160, 160), margin_ratio=1.35):
     """
-    Mendeteksi wajah menggunakan MTCNN dengan multi-rotation evaluation (0°, 90°, 180°, 270°),
-    mengabaikan noise/speck kecil (< 55 px), crop area wajah dengan padding 20%,
-    lalu resize ke ukuran yang dibutuhkan FaceNet (160x160).
-    Jika return_mirror=True, mengembalikan tuple (face_tensor, face_mirror_tensor).
+    1. Menyelaraskan kemiringan wajah (eye alignment) jika landmark tersedia (-35° s/d 35°).
+    2. Melakukan crop simetris persegi (1:1 aspect ratio) dengan padding border reflection.
+       Hal ini mencegah wajah tertekan/terdistorsi saat di-resize ke target_size (160x160)
+       dan mencegah dahi terpotong jika wajah mepet batas atas (y <= 17).
+    """
+    ih, iw = img_rgb.shape[:2]
+    x, y, w, h = face['box']
+    kp = face.get('keypoints')
+    
+    aligned_img = img_rgb
+    cx = x + w / 2.0
+    cy = y + h * 0.45  
+
+    if kp:
+        lx, ly = kp['left_eye']
+        rx, ry = kp['right_eye']
+        dx = rx - lx
+        dy = ry - ly
+        tilt_angle = np.degrees(np.arctan2(dy, dx))
+        
+        
+        if 1.5 < abs(tilt_angle) < 35.0:
+            eye_center = (float((lx + rx) / 2.0), float((ly + ry) / 2.0))
+            M = cv2.getRotationMatrix2D(eye_center, tilt_angle, 1.0)
+            aligned_img = cv2.warpAffine(
+                img_rgb, M, (iw, ih),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_REFLECT_101
+            )
+           
+            pt = np.array([cx, cy, 1.0])
+            cx = float(np.dot(M[0], pt))
+            cy = float(np.dot(M[1], pt))
+
+
+    side = int(round(max(w, h) * margin_ratio))
+    side = max(side, 120)
+
+    x1 = int(round(cx - side / 2.0))
+    y1 = int(round(cy - side / 2.0))
+    x2 = x1 + side
+    y2 = y1 + side
+
+    # Tangani batas luar gambar dengan Border Reflection (mencegah dahi terpotong tanpa distorsi)
+    pad_l = max(0, -x1)
+    pad_t = max(0, -y1)
+    pad_r = max(0, x2 - iw)
+    pad_b = max(0, y2 - ih)
+
+    if pad_l > 0 or pad_t > 0 or pad_r > 0 or pad_b > 0:
+        padded = cv2.copyMakeBorder(
+            aligned_img, pad_t, pad_b, pad_l, pad_r,
+            cv2.BORDER_REFLECT_101
+        )
+        crop_np = padded[y1 + pad_t : y2 + pad_t, x1 + pad_l : x2 + pad_l]
+    else:
+        crop_np = aligned_img[y1:y2, x1:x2]
+
+    if crop_np.size == 0 or crop_np.shape[0] < 10 or crop_np.shape[1] < 10:
+        crop_np = cv2.resize(aligned_img, target_size)
+
+    face_pil = Image.fromarray(crop_np).resize(target_size, Image.LANCZOS)
+    face_arr = np.array(face_pil, dtype='float32')
+    face_norm = (face_arr - 127.5) / 128.0
+    return face_norm
+
+
+def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False, multi_margin=False):
+    """
+    Mendeteksi wajah menggunakan MTCNN dengan evaluasi rotasi cerdas (anti-180° inversion),
+    eye alignment, padding simetris persegi (1:1) tanpa distorsi aspek rasio,
+    dan normalisasi FaceNet standard.
     """
     try:
         img = Image.open(image_path).convert('RGB')
         # Fix EXIF orientation (penting untuk foto dari HP Android/iOS/Tablet)
         img = ImageOps.exif_transpose(img)
         img_rgb = np.array(img)
+        ih, iw = img_rgb.shape[:2]
 
         # 1. Coba deteksi pada orientasi asli (0°)
         results_0 = detector.detect_faces(img_rgb)
-        best_face_0 = _filter_best_real_face(results_0, min_size=70)
+        best_face_0 = _filter_best_real_face(results_0, min_size=50, require_upright=True)
 
         best_candidate = None
-        # Jika orientasi 0° sudah memiliki wajah besar yang jelas (min 90px & conf >= 0.95), langsung gunakan
-        if best_face_0 and min(best_face_0['box'][2], best_face_0['box'][3]) >= 90 and best_face_0['confidence'] >= 0.95:
+        # Jika orientasi 0° sudah memiliki wajah tegak yang jelas (conf >= 0.85), langsung gunakan!
+        # JANGAN pernah merotasi jika di 0° sudah terdeteksi wajah tegak manusia.
+        if best_face_0 and best_face_0['confidence'] >= 0.85:
             best_candidate = {
                 'face': best_face_0,
                 'image': img_rgb,
                 'rotation': 0,
-                'area': best_face_0['box'][2] * best_face_0['box'][3],
                 'conf': best_face_0['confidence']
             }
         else:
-            # 2. Evaluasi semua rotasi untuk mencari wajah manusia asli terbesar (anti-speck)
+            # 2. Hanya jika di 0° tidak ada wajah tegak yang meyakinkan, baru evaluasi rotasi lain
+            candidates = []
+            if best_face_0:
+                candidates.append({
+                    'face': best_face_0,
+                    'image': img_rgb,
+                    'rotation': 0,
+                    'conf': best_face_0['confidence']
+                })
+
             all_rotations = [
-                (0, None, results_0),
-                (90, cv2.ROTATE_90_CLOCKWISE, None),
-                (180, cv2.ROTATE_180, None),
-                (270, cv2.ROTATE_90_COUNTERCLOCKWISE, None),
+                (90, cv2.ROTATE_90_CLOCKWISE),
+                (270, cv2.ROTATE_90_COUNTERCLOCKWISE),
+                (180, cv2.ROTATE_180),
             ]
 
-            candidates = []
-            for angle, rot_code, pre_results in all_rotations:
-                if rot_code is None:
-                    rot_img = img_rgb
-                    res = pre_results if pre_results is not None else detector.detect_faces(rot_img)
-                else:
-                    rot_img = cv2.rotate(img_rgb, rot_code)
-                    res = detector.detect_faces(rot_img)
-
-                f = _filter_best_real_face(res, min_size=55)
-                if f:
-                    area = f['box'][2] * f['box'][3]
+            for angle, rot_code in all_rotations:
+                rot_img = cv2.rotate(img_rgb, rot_code)
+                res = detector.detect_faces(rot_img)
+                f = _filter_best_real_face(res, min_size=50, require_upright=True)
+                if f and f['confidence'] >= 0.80:
                     candidates.append({
                         'face': f,
                         'image': rot_img,
                         'rotation': angle,
-                        'area': area,
                         'conf': f['confidence']
                     })
 
             if candidates:
-                # Pilih rotasi yang menghasilkan wajah terbesar & paling percaya diri
-                best_candidate = max(candidates, key=lambda c: (c['area'], c['conf']))
-                if best_candidate['rotation'] != 0:
-                    print(f"   🔄 [FaceNet] Terpilih rotasi optimal: {best_candidate['rotation']}° (area: {best_candidate['area']} px²)")
+                # Prioritaskan rotasi 0° jika ada, kemudian confidence tertinggi
+                candidates_0 = [c for c in candidates if c['rotation'] == 0]
+                if candidates_0:
+                    best_candidate = max(candidates_0, key=lambda c: c['conf'])
+                else:
+                    best_candidate = max(candidates, key=lambda c: c['conf'])
+                    print(f"   🔄 [FaceNet] Terpilih rotasi tegak: {best_candidate['rotation']}° (conf: {best_candidate['conf']:.3f})")
 
         # 3. Jika wajah valid ditemukan:
         if best_candidate:
@@ -104,52 +202,52 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
             x, y, w, h = best_face['box']
             conf = best_face['confidence']
 
-            # Padding 20% proporsional untuk margin
-            pad_w = int(w * 0.20)
-            pad_h = int(h * 0.20)
-            ih, iw = active_rgb.shape[:2]
-            x1 = max(0, x - pad_w)
-            y1 = max(0, y - pad_h)
-            x2 = min(iw, x + w + pad_w)
-            y2 = min(ih, y + h + pad_h)
+            face_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.35)
+            face_tensor = np.expand_dims(face_norm, axis=0)
 
-            crop_np = active_rgb[y1:y2, x1:x2]
-            if crop_np.size > 0:
-                face_crop = Image.fromarray(crop_np).resize(target_size, Image.LANCZOS)
-                face_array = np.array(face_crop, dtype='float32')
-                face_norm = (face_array - 127.5) / 128.0
-                face_tensor = np.expand_dims(face_norm, axis=0)
+            print(f"   ✅ [FaceNet] MTCNN OK (rot: {detected_rot}°, conf: {conf:.3f}, box: [{x},{y},{w},{h}], 1:1 square crop)")
 
-                print(f"   ✅ [FaceNet] MTCNN OK (rot: {detected_rot}°, conf: {conf:.3f}, box: [{x},{y},{w},{h}])")
+            if multi_margin:
+                # Crop tighter (margin 1.15) untuk mencocokkan foto registrasi close-up
+                tight_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.15)
+                tight_tensor = np.expand_dims(tight_norm, axis=0)
+                return face_tensor, tight_tensor
 
-                if return_mirror:
-                    # Buat versi horizontal flip (mirror) untuk mengatasi perbedaan selfie camera mirror
-                    face_flip_norm = np.fliplr(face_norm)
-                    face_flip_tensor = np.expand_dims(face_flip_norm, axis=0)
-                    return face_tensor, face_flip_tensor
+            if return_mirror:
+                face_flip_norm = np.fliplr(face_norm)
+                face_flip_tensor = np.expand_dims(face_flip_norm, axis=0)
+                return face_tensor, face_flip_tensor
 
-                return face_tensor
+            return face_tensor
 
         # 4. Fallback jika MTCNN gagal tapi gambar sudah berupa foto wajah pre-cropped
-        ih, iw = img_rgb.shape[:2]
         aspect = iw / max(ih, 1)
-        if 0.60 <= aspect <= 1.60 and min(iw, ih) >= 80:
-            print(f"   ℹ️ [FaceNet] MTCNN no-landmark, fallback direct crop ({iw}x{ih})")
-            face_crop = img.resize(target_size, Image.LANCZOS)
-            face_array = np.array(face_crop, dtype='float32')
-            face_norm = (face_array - 127.5) / 128.0
+        if 0.50 <= aspect <= 1.80 and min(iw, ih) >= 60:
+            print(f"   ℹ️ [FaceNet] MTCNN no-face, fallback direct square crop ({iw}x{ih})")
+            max_d = max(iw, ih)
+            pad_w = (max_d - iw) // 2
+            pad_h = (max_d - ih) // 2
+            padded_img = cv2.copyMakeBorder(
+                img_rgb, pad_h, max_d - ih - pad_h, pad_w, max_d - iw - pad_w,
+                cv2.BORDER_REFLECT_101
+            )
+            face_pil = Image.fromarray(padded_img).resize(target_size, Image.LANCZOS)
+            face_arr = np.array(face_pil, dtype='float32')
+            face_norm = (face_arr - 127.5) / 128.0
             face_tensor = np.expand_dims(face_norm, axis=0)
+            if multi_margin:
+                return face_tensor, face_tensor
             if return_mirror:
                 face_flip_norm = np.fliplr(face_norm)
                 return face_tensor, np.expand_dims(face_flip_norm, axis=0)
             return face_tensor
 
         print(f"   ⚠️ [FaceNet] Tidak ada wajah valid terdeteksi di {os.path.basename(image_path)} (dim: {iw}x{ih})")
-        return (None, None) if return_mirror else None
+        return (None, None) if (return_mirror or multi_margin) else None
 
     except Exception as e:
         print(f"   ❌ Error saat deteksi wajah: {e}")
-        return (None, None) if return_mirror else None
+        return (None, None) if (return_mirror or multi_margin) else None
 
 
 # ============================================
@@ -158,7 +256,7 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
 def get_embedding(image_path):
     """
     Mengekstrak embedding 512-dimensi dari wajah yang terdeteksi (single primary).
-    Pipeline: Load → MTCNN Detect → Crop → Normalize → FaceNet Predict
+    Embedding selalu dinormalisasi L2 agar cosine similarity = dot product.
     """
     try:
         face = detect_and_crop_face(image_path, return_mirror=False)
@@ -166,6 +264,9 @@ def get_embedding(image_path):
             print(f"   ⚠️ Tidak ada wajah terdeteksi di: {os.path.basename(image_path)}")
             return None
         embedding = model.predict(face, verbose=0)[0]
+        norm = np.linalg.norm(embedding)
+        if norm > 1e-9:
+            embedding = embedding / norm
         return embedding
     except Exception as e:
         print(f"   ❌ Error extracting embedding: {e}")
@@ -174,17 +275,45 @@ def get_embedding(image_path):
 
 def get_embeddings(image_path):
     """
-    Mengekstrak embedding wajah primer dan versi mirror (horizontal flip).
-    Mengembalikan (embedding_primer, embedding_mirror).
+    Mengekstrak embedding multi-margin & multi-mirror:
+    - Standard square crop (margin 1.35) + mirror
+    - Tight square crop (margin 1.15) + mirror
+    Mengembalikan (primary_embedding, candidate_embeddings_list).
+    Semua embedding dinormalisasi L2.
     """
     try:
-        face, face_flip = detect_and_crop_face(image_path, return_mirror=True)
-        if face is None:
+        crops = detect_and_crop_face(image_path, multi_margin=True)
+        if crops is None or crops[0] is None:
             print(f"   ⚠️ Tidak ada wajah terdeteksi di: {os.path.basename(image_path)}")
             return None, None
-        emb = model.predict(face, verbose=0)[0]
-        emb_flip = model.predict(face_flip, verbose=0)[0]
-        return emb, emb_flip
+        face_std, face_tight = crops
+
+        # 1. Standard crop & mirror
+        emb_std = model.predict(face_std, verbose=0)[0]
+        norm_std = np.linalg.norm(emb_std)
+        if norm_std > 1e-9:
+            emb_std = emb_std / norm_std
+
+        face_std_flip = np.expand_dims(np.fliplr(face_std[0]), axis=0)
+        emb_std_flip = model.predict(face_std_flip, verbose=0)[0]
+        norm_sf = np.linalg.norm(emb_std_flip)
+        if norm_sf > 1e-9:
+            emb_std_flip = emb_std_flip / norm_sf
+
+        # 2. Tight crop & mirror
+        emb_tight = model.predict(face_tight, verbose=0)[0]
+        norm_t = np.linalg.norm(emb_tight)
+        if norm_t > 1e-9:
+            emb_tight = emb_tight / norm_t
+
+        face_tight_flip = np.expand_dims(np.fliplr(face_tight[0]), axis=0)
+        emb_tight_flip = model.predict(face_tight_flip, verbose=0)[0]
+        norm_tf = np.linalg.norm(emb_tight_flip)
+        if norm_tf > 1e-9:
+            emb_tight_flip = emb_tight_flip / norm_tf
+
+        candidates = [emb_std, emb_std_flip, emb_tight, emb_tight_flip]
+        return emb_std, candidates
     except Exception as e:
         print(f"   ❌ Error extracting embeddings: {e}")
         return None, None
@@ -193,22 +322,52 @@ def get_embeddings(image_path):
 # ============================================
 # FACE COMPARISON (Cosine Similarity)
 # ============================================
-def compare_faces(test_embedding, known_embeddings, threshold, test_embedding_flipped=None):
+def compare_faces(test_embedding, known_embeddings, threshold=None, test_embedding_flipped=None):
     """
     Membandingkan embedding test dengan daftar embedding yang tersimpan.
-    Jika test_embedding_flipped disediakan, juga membandingkan versi mirror
-    dan mengambil nilai similarity tertinggi (mengatasi kamera selfie mirror).
-    Mengembalikan skor similarity tertinggi (0.0 - 1.0).
+    Mendukung input single vector, flipped vector, maupun candidate list multi-crop.
+    Mengembalikan skor similarity tertinggi (0.0 - 1.0) dengan akurasi tinggi.
     """
+    if test_embedding is None or not known_embeddings:
+        return 0.0
+
+    # Kumpulkan semua query candidate vectors
+    query_vectors = []
+    if isinstance(test_embedding, (list, tuple)):
+        query_vectors.extend(test_embedding)
+    elif isinstance(test_embedding, np.ndarray):
+        query_vectors.append(test_embedding)
+
+    if test_embedding_flipped is not None:
+        if isinstance(test_embedding_flipped, (list, tuple)):
+            query_vectors.extend(test_embedding_flipped)
+        elif isinstance(test_embedding_flipped, np.ndarray):
+            query_vectors.append(test_embedding_flipped)
+
+    norm_queries = []
+    for q in query_vectors:
+        if q is not None and isinstance(q, np.ndarray):
+            norm = np.linalg.norm(q)
+            if norm > 1e-9:
+                norm_queries.append(q / norm)
+
+    if not norm_queries:
+        return 0.0
+
     best_similarity = 0.0
     for emb in known_embeddings:
-        similarity = 1 - cosine(test_embedding, emb)
-        if similarity > best_similarity:
-            best_similarity = similarity
-        if test_embedding_flipped is not None:
-            sim_flip = 1 - cosine(test_embedding_flipped, emb)
-            if sim_flip > best_similarity:
-                best_similarity = sim_flip
+        if emb is None:
+            continue
+        norm_e = np.linalg.norm(emb)
+        if norm_e < 1e-9:
+            continue
+        emb_norm = emb / norm_e
+
+        for q in norm_queries:
+            similarity = float(np.dot(q, emb_norm))
+            if similarity > best_similarity:
+                best_similarity = similarity
+
     return best_similarity
 
 
@@ -217,7 +376,7 @@ def compare_faces(test_embedding, known_embeddings, threshold, test_embedding_fl
 # ============================================
 def read_txt(data_path):
     """Membaca file metadata [NIP, Nama] dari file .txt."""
-    with open(data_path, 'r') as file:
+    with open(data_path, 'r', encoding='utf-8') as file:
         line = file.readline().strip().strip('[]')
         nip, name = line.split(', ')
     return nip, name
@@ -243,7 +402,7 @@ def is_valid_image(file_storage):
 def register_user_and_generate_embeddings(person_nip, person_name, image_files):
     """
     Menyimpan foto wajah dan menghasilkan embedding menggunakan
-    pipeline MTCNN + FaceNet yang benar.
+    pipeline MTCNN + FaceNet yang benar dengan square padding dan normalisasi L2.
     """
     curr_dir = os.getcwd()
     samples_dir = os.path.join(curr_dir, "samples")
@@ -272,10 +431,80 @@ def register_user_and_generate_embeddings(person_nip, person_name, image_files):
 
         with open(pkl_path, "wb") as f:
             pickle.dump(embeddings, f)
-        with open(txt_path, "w") as f:
+        with open(txt_path, "w", encoding="utf-8") as f:
             f.write(f"[{person_nip}, {person_name}]\n")
 
         print(f"   📦 {len(embeddings)}/{len(image_files)} embedding disimpan untuk {person_name}")
         return {"message": f"{len(embeddings)} embeddings saved for {person_nip} (MTCNN pipeline)"}, 200
     else:
         return {"error": "Tidak ada wajah yang terdeteksi di semua foto. Pastikan foto menampilkan wajah dengan jelas."}, 400
+
+
+# ============================================
+# EMBEDDING MIGRATION / REFRESH HELPER
+# ============================================
+def refresh_user_embeddings(nip):
+    """
+    Memperbarui file .pkl embedding untuk NIP tertentu langsung dari folder samples/<nip>.
+    """
+    curr_dir = os.getcwd()
+    sample_folder = os.path.join(curr_dir, "samples", str(nip))
+    emb_folder = os.path.join(curr_dir, "samples_embedding", str(nip))
+    if not os.path.exists(sample_folder):
+        return False
+
+    img_files = [f for f in os.listdir(sample_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    if not img_files:
+        return False
+
+    new_embeddings = []
+    for fname in sorted(img_files):
+        fpath = os.path.join(sample_folder, fname)
+        emb = get_embedding(fpath)
+        if emb is not None:
+            new_embeddings.append(emb)
+
+    if new_embeddings:
+        os.makedirs(emb_folder, exist_ok=True)
+        pkl_path = os.path.join(emb_folder, f"{nip}.pkl")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(new_embeddings, f)
+        print(f"   🔄 [REFRESH] Berhasil memperbarui {len(new_embeddings)} embedding untuk {nip}")
+        return True
+    return False
+
+
+def _auto_refresh_active_users():
+    """
+    Sinkronisasi embedding dari folder samples/ ke samples_embedding/
+    menggunakan pipeline square crop & L2 normalization terbaru.
+    """
+    try:
+        curr_dir = os.getcwd()
+        samples_dir = os.path.join(curr_dir, "samples")
+        emb_dir = os.path.join(curr_dir, "samples_embedding")
+        marker_file = os.path.join(emb_dir, ".v2_migrated")
+        if os.path.exists(marker_file) or not os.path.exists(samples_dir):
+            return
+
+        print("🔄 [AUTO-SYNC] Memulai sinkronisasi embedding dengan pipeline v2...")
+        user_dirs = [d for d in os.listdir(samples_dir) if os.path.isdir(os.path.join(samples_dir, d))]
+        if "031188791093271576" in user_dirs:
+            user_dirs.remove("031188791093271576")
+            user_dirs.insert(0, "031188791093271576")
+
+        for nip in user_dirs:
+            try:
+                refresh_user_embeddings(nip)
+            except Exception as ue:
+                print(f"⚠️ [AUTO-SYNC] Gagal update {nip}: {ue}")
+
+        with open(marker_file, "w") as f:
+            f.write("v2_all_users_migrated\n")
+        print("✅ [AUTO-SYNC] Seluruh embedding berhasil dimigrasikan ke pipeline v2.")
+    except Exception as e:
+        print(f"⚠️ [AUTO-SYNC] Error refresh embedding: {e}")
+
+# Jalankan auto refresh di background thread agar tidak menahan startup
+threading.Thread(target=_auto_refresh_active_users, daemon=True).start()
+

@@ -2383,7 +2383,7 @@ def predict_kegiatan():
     temp_filename = f"{uuid4().hex}.jpg"
     image_path = os.path.join(TEMP_DIR, temp_filename)
     photo.save(image_path)
-    test_embedding = get_embedding(image_path)
+    test_embedding, test_candidates = get_embeddings(image_path)
     if test_embedding is None:
         return jsonify({"error": "Gagal mendeteksi wajah."}), 500
 
@@ -2394,7 +2394,7 @@ def predict_kegiatan():
         if not os.path.exists(pkl_path) or not os.path.exists(txt_path): continue
         with open(pkl_path, "rb") as f:
             known_embeddings = pickle.load(f)
-        similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD)
+        similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD, test_candidates)
         if similarity > best_similarity:
             best_similarity = similarity
             best_nip, best_name = read_txt(txt_path)

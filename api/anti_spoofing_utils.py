@@ -42,9 +42,8 @@ FAS_THRESHOLD = 0.65
 # Wajah asli menghasilkan micro-movement >= 1.5 pixel units
 MIN_MOTION_THRESHOLD = 1.5  # pixel intensity units
 
-# Maximum motion — terlalu banyak gerakan = mungkin sedang ganti foto
-# Dinaikkan dari 20→25 karena tangan manusia normal bisa gemetar >20
-MAX_MOTION_THRESHOLD = 25.0
+# Maximum motion — dinaikkan untuk mengakomodasi getaran tablet handheld / tap layar (hingga ~80px)
+MAX_MOTION_THRESHOLD = 80.0
 
 # Camera shake zone — motion di rentang ini mencurigakan (shake, bukan wajah)
 SHAKE_MOTION_LOW = 0.5
@@ -199,19 +198,17 @@ def _analyze_motion(frames_gray: list) -> dict:
         score = 0.15
         detail = f"TOO STATIC (motion={avg_motion:.2f} < {MIN_MOTION_THRESHOLD})"
     elif avg_motion > MAX_MOTION_THRESHOLD:
-        # Gerakan berlebihan — penalty lunak karena bisa jadi tangan gemetar
-        # Beri skor 0.50 (bukan 0.30), biarkan analyzer lain yang memutuskan
+        # Gerakan berlebihan (> 80.0) — penalty lunak karena bisa jadi gerakan mendadak/ganti foto
         score = 0.50
         detail = f"EXCESSIVE MOTION ({avg_motion:.2f}) — soft penalty"
     else:
-        # Ada movement — kemungkinan wajah asli
-        # Skor proporsional terhadap jumlah motion (lebih banyak = lebih meyakinkan real)
-        motion_normalized = min(1.0, (avg_motion - MIN_MOTION_THRESHOLD) / 10.0)
+        # Ada movement wajar — tipikal handheld smartphone/tablet
+        motion_normalized = min(1.0, (avg_motion - MIN_MOTION_THRESHOLD) / 12.0)
         
         # Bonus: regional variation (wajah asli → movement tidak seragam)
         regional_bonus = min(0.2, avg_regional_std * 0.1)
         
-        score = 0.5 + motion_normalized * 0.4 + regional_bonus
+        score = 0.6 + motion_normalized * 0.3 + regional_bonus
         detail = f"NATURAL MOTION (motion={avg_motion:.2f})"
     
     return {
@@ -380,14 +377,13 @@ def _analyze_color_variance(image_paths: list) -> dict:
     if avg_var < 3.0 and avg_blue > 0.38:
         score = 0.15
         detail = f"SCREEN SIGNATURE (var={avg_var:.2f}, blue={avg_blue:.3f})"
-    # Tier 2: Kemungkinan layar (uniform RGB tapi blue tidak dominant)
+    # Tier 2: Pencahayaan indoor seragam tapi blue backlight normal (bukan layar)
     elif avg_var < 3.0:
-        score = 0.35
-        detail = f"LOW COLOR VARIANCE (var={avg_var:.2f})"
-    # Tier 3: Zona abu-abu (indoor flat lighting bisa masuk sini)
-    # Relaxed: var 3.0-5.0 dianggap mungkin real, beri skor netral
+        score = 0.50
+        detail = f"INDOOR UNIFORM LIGHTING (var={avg_var:.2f})"
+    # Tier 3: Zona abu-abu (indoor flat lighting)
     elif avg_var < 5.0:
-        score = 0.60
+        score = 0.65
         detail = f"MODERATE COLOR VARIANCE (var={avg_var:.2f})"
     # Tier 4: Pasti organik (high variance = kulit manusia 3D)
     else:
