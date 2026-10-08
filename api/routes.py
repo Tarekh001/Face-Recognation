@@ -7,7 +7,7 @@ import shutil
 from models import db, User, Presensi, MasterOpd, AuditLog, Device, SnMesin, UserAksesOpd, DataPegawai, UserAdmin, AppSetting, HariLiburCustom, JadwalKegiatan, UndanganKegiatan, PresensiKegiatan
 from functools import wraps
 from flask import Blueprint, request, jsonify
-from api.facenet_utils import get_embedding, compare_faces, read_txt, is_valid_image, register_user_and_generate_embeddings
+from api.facenet_utils import get_embedding, get_embeddings, compare_faces, read_txt, is_valid_image, register_user_and_generate_embeddings
 from config.config import EMBEDDINGS_DIR, TEMP_DIR, THRESHOLD
 from uuid import uuid4
 from datetime import datetime, timedelta, date as date_type, time as time_type
@@ -356,7 +356,7 @@ def predict():
     image_path = os.path.join(TEMP_DIR, temp_filename)
     photo.save(image_path)
 
-    test_embedding = get_embedding(image_path)
+    test_embedding, test_embedding_flip = get_embeddings(image_path)
     #os.remove(image_path)
 
     if test_embedding is None:
@@ -374,7 +374,7 @@ def predict():
         with open(pkl_path, "rb") as f:
             known_embeddings = pickle.load(f)
 
-        similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD)
+        similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD, test_embedding_flip)
         if similarity > best_similarity:
             best_similarity = similarity
             best_nip, best_name = read_txt(txt_path)
@@ -559,7 +559,7 @@ def predict_unlock():
     image_path = os.path.join(TEMP_DIR, temp_filename)
     photo.save(image_path)
 
-    test_embedding = get_embedding(image_path)
+    test_embedding, test_embedding_flip = get_embeddings(image_path)
     os.remove(image_path)
 
     if test_embedding is None:
@@ -578,7 +578,7 @@ def predict_unlock():
         with open(pkl_path, "rb") as f:
             known_embeddings = pickle.load(f)
 
-        similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD)
+        similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD, test_embedding_flip)
         if similarity > best_similarity:
             best_similarity = similarity
             best_nip, best_name = read_txt(txt_path)
