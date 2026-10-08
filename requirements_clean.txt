@@ -1,0 +1,29 @@
+# ========================================================
+# Requirements untuk Server (Python 3.10 - Windows)
+# ========================================================
+
+# Flask & Web
+Flask>=3.0.0,<3.2.0
+Flask-SQLAlchemy>=3.1.0
+flask-cors>=5.0.0
+Werkzeug>=3.0.0
+requests>=2.31.0
+
+# Database & Keamanan
+psycopg2-binary>=2.9.9
+PyJWT>=2.8.0
+pytz>=2024.1
+holidays>=0.40
+
+# AI, Face Recognition & Computer Vision
+tensorflow>=2.15.0,<=2.19.0
+keras-facenet>=0.3.2
+mtcnn>=0.1.1
+opencv-python>=4.8.0
+pillow>=10.0.0
+scipy>=1.11.0
+numpy>=1.24.0,<2.2.0
+
+# Utilities
+networkx>=3.4.0,<=3.4.2
+python-dateutil>=2.8.2

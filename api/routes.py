@@ -251,7 +251,12 @@ def check_spoof():
                 f.save(temp_path)
                 temp_paths.append(temp_path)
             
-            is_real, confidence = spoof_checker.check_liveness_multi(temp_paths)
+            res = spoof_checker.check_liveness_multi(temp_paths)
+            if len(res) == 3:
+                is_real, confidence, label = res
+            else:
+                is_real, confidence = res
+                label = "REAL" if is_real else "SPOOF"
             
         elif 'photo' in request.files:
             # Single-frame fallback
@@ -260,7 +265,12 @@ def check_spoof():
             photo.save(temp_path)
             temp_paths.append(temp_path)
             
-            is_real, confidence = spoof_checker.check_liveness(temp_path)
+            res = spoof_checker.check_liveness(temp_path)
+            if len(res) == 3:
+                is_real, confidence, label = res
+            else:
+                is_real, confidence = res
+                label = "REAL" if is_real else "SPOOF"
         else:
             return jsonify({"error": "Kirim frame_0/frame_1/frame_2 atau photo"}), 400
 
@@ -268,7 +278,7 @@ def check_spoof():
             "is_real": is_real,
             "confidence": round(confidence, 4),
             "threshold": spoof_checker.threshold,
-            "label": "REAL" if is_real else "SPOOF",
+            "label": label,
             "frames_analyzed": len(temp_paths),
         }), 200
 
@@ -432,6 +442,11 @@ def predict():
                 print(f"\n🟡 [FACE-AI] OUT OF HOURS: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Waktu: {now.strftime('%H:%M:%S')}")
                 print(f"   ↳ Dikenali tapi di luar jam presensi ({jam_masuk_mulai.strftime('%H:%M')}-{jam_masuk_akhir.strftime('%H:%M')} / {jam_keluar_mulai.strftime('%H:%M')}-{jam_keluar_akhir.strftime('%H:%M')})\n")
                 return jsonify({"message": f"Maaf {user.nama_lengkap}, sekarang bukan jam presensi ASN."}), 403
+                # # ── BYPASS SEMENTARA: Hilangkan batasan range waktu presensi ──
+                # # Mengizinkan presensi kapan saja saat masa pengujian/demo.
+                # # Sebelum jam 13:00 dialokasikan 'IN', setelah jam 13:00 dialokasikan 'OUT'.
+                # status_absen = "IN" if ct < time_type(13, 0) else "OUT"
+                # print(f"\nℹ️ [FACE-AI] Bypass Range Waktu: {user.nama_lengkap} (NIP: {best_nip}) otomatis dialokasikan '{status_absen}' (Waktu: {now.strftime('%H:%M:%S')})")
 
             # ── Attendance identifier: use AI-recognized NIP/NIK (best_nip) directly ──
             # best_nip is ALWAYS populated here — it came from the face embedding match.

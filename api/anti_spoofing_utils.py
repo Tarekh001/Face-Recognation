@@ -88,6 +88,20 @@ def _load_and_crop_face(image_path: str, target_size=(200, 200)):
             return gray, cv2.resize(img_bgr, target_size), img_rgb.shape[:2]
 
         results = mtcnn.detect_faces(img_rgb)
+        best_rot_rgb = img_rgb
+        best_rot_bgr = img_bgr
+
+        if not results:
+            # Fallback untuk tablet/kiosk camera dengan orientasi sensor miring (90°, 270°, 180°)
+            for rot_code in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
+                cand_rgb = cv2.rotate(img_rgb, rot_code)
+                cand_results = mtcnn.detect_faces(cand_rgb)
+                if cand_results:
+                    results = cand_results
+                    best_rot_rgb = cand_rgb
+                    best_rot_bgr = cv2.cvtColor(best_rot_rgb, cv2.COLOR_RGB2BGR)
+                    break
+
         if not results:
             return None, None, None
 
@@ -96,11 +110,14 @@ def _load_and_crop_face(image_path: str, target_size=(200, 200)):
         
         # Padding 25%
         pad = int(max(w, h) * 0.25)
-        ih, iw = img_bgr.shape[:2]
+        ih, iw = best_rot_bgr.shape[:2]
         x1, y1 = max(0, x-pad), max(0, y-pad)
         x2, y2 = min(iw, x+w+pad), min(ih, y+h+pad)
         
-        face_bgr = img_bgr[y1:y2, x1:x2]
+        face_bgr = best_rot_bgr[y1:y2, x1:x2]
+        if face_bgr.size == 0:
+            return None, None, None
+            
         face_gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
         
         face_gray = cv2.resize(face_gray, target_size)
@@ -432,8 +449,8 @@ class AntiSpoofingChecker:
             print("[MultiFrame-FAS] Not enough frames with face detected")
             if len(frames_gray) == 1:
                 # Single frame fallback — skor neutral
-                return True, 0.6
-            return False, 0.0
+                return True, 0.6, "SINGLE_FRAME"
+            return False, 0.0, "NO_FACE"
         
         print(f"[MultiFrame-FAS] Analyzing {len(frames_gray)} frames...")
         
@@ -479,7 +496,7 @@ class AntiSpoofingChecker:
         print(f"[MultiFrame-FAS] => Final={final:.3f} (thr={self.threshold}) => {label}")
         print(f"   Detail: {motion['detail']} | {color['detail']}")
         
-        return is_real, float(final)
+        return is_real, float(final), label
 
 
 # Singleton
