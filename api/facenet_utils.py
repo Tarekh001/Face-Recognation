@@ -97,8 +97,12 @@ def align_and_square_crop(img_rgb, face, target_size=(160, 160), margin_ratio=1.
             cy = float(np.dot(M[1], pt))
 
 
-    side = int(round(max(w, h) * margin_ratio))
-    side = max(side, 120)
+    # Jika gambar sudah berupa foto crop wajah dari client (wajah memenuhi > 55% area),
+    # gunakan batas margin proporsional (max 1.25) agar tidak menciptakan distorsi pantulan cermin (BORDER_REFLECT)
+    face_coverage = max(w / max(iw, 1), h / max(ih, 1))
+    actual_margin = min(margin_ratio, 1.25) if face_coverage > 0.55 else margin_ratio
+    side = int(round(max(w, h) * actual_margin))
+    side = max(side, 100)
 
     x1 = int(round(cx - side / 2.0))
     y1 = int(round(cy - side / 2.0))
@@ -167,10 +171,11 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
                     'conf': best_face_0['confidence']
                 })
 
+            # Evaluasi rotasi kemiringan (90° dan 270°). 
+            # 180° diabaikan karena presensi fisik manusia tidak pernah terbalik (upside down)
             all_rotations = [
                 (90, cv2.ROTATE_90_CLOCKWISE),
                 (270, cv2.ROTATE_90_COUNTERCLOCKWISE),
-                (180, cv2.ROTATE_180),
             ]
 
             for angle, rot_code in all_rotations:
@@ -202,14 +207,14 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
             x, y, w, h = best_face['box']
             conf = best_face['confidence']
 
-            face_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.35)
+            face_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.25)
             face_tensor = np.expand_dims(face_norm, axis=0)
 
             print(f"   ✅ [FaceNet] MTCNN OK (rot: {detected_rot}°, conf: {conf:.3f}, box: [{x},{y},{w},{h}], 1:1 square crop)")
 
             if multi_margin:
-                # Crop tighter (margin 1.15) untuk mencocokkan foto registrasi close-up
-                tight_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.15)
+                # Crop tighter (margin 1.00) untuk mencocokkan fitur wajah inti / foto registrasi close-up
+                tight_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.00)
                 tight_tensor = np.expand_dims(tight_norm, axis=0)
                 return face_tensor, tight_tensor
 
@@ -378,7 +383,9 @@ def read_txt(data_path):
     """Membaca file metadata [NIP, Nama] dari file .txt."""
     with open(data_path, 'r', encoding='utf-8') as file:
         line = file.readline().strip().strip('[]')
-        nip, name = line.split(', ')
+        parts = line.split(', ', 1)
+        nip = parts[0].strip()
+        name = parts[1].strip() if len(parts) > 1 else nip
     return nip, name
 
 
