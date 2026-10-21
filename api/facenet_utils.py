@@ -73,7 +73,7 @@ def align_and_square_crop(img_rgb, face, target_size=(160, 160), margin_ratio=1.
     
     aligned_img = img_rgb
     cx = x + w / 2.0
-    cy = y + h * 0.45  
+    cy = y + h * 0.40  
 
     if kp:
         lx, ly = kp['left_eye']
@@ -100,7 +100,7 @@ def align_and_square_crop(img_rgb, face, target_size=(160, 160), margin_ratio=1.
     # Jika gambar sudah berupa foto crop wajah dari client (wajah memenuhi > 55% area),
     # gunakan batas margin proporsional (max 1.25) agar tidak menciptakan distorsi pantulan cermin (BORDER_REFLECT)
     face_coverage = max(w / max(iw, 1), h / max(ih, 1))
-    actual_margin = min(margin_ratio, 1.25) if face_coverage > 0.55 else margin_ratio
+    actual_margin = margin_ratio
     side = int(round(max(w, h) * actual_margin))
     side = max(side, 100)
 
@@ -133,7 +133,7 @@ def align_and_square_crop(img_rgb, face, target_size=(160, 160), margin_ratio=1.
     return face_norm
 
 
-def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False, multi_margin=False):
+def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False, multi_margin=False, allow_fallback=True):
     """
     Mendeteksi wajah menggunakan MTCNN dengan evaluasi rotasi cerdas (anti-180° inversion),
     eye alignment, padding simetris persegi (1:1) tanpa distorsi aspek rasio,
@@ -207,14 +207,14 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
             x, y, w, h = best_face['box']
             conf = best_face['confidence']
 
-            face_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.25)
+            face_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.35)
             face_tensor = np.expand_dims(face_norm, axis=0)
 
             print(f"   ✅ [FaceNet] MTCNN OK (rot: {detected_rot}°, conf: {conf:.3f}, box: [{x},{y},{w},{h}], 1:1 square crop)")
 
             if multi_margin:
                 # Crop tighter (margin 1.00) untuk mencocokkan fitur wajah inti / foto registrasi close-up
-                tight_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.00)
+                tight_norm = align_and_square_crop(active_rgb, best_face, target_size=target_size, margin_ratio=1.15)
                 tight_tensor = np.expand_dims(tight_norm, axis=0)
                 return face_tensor, tight_tensor
 
@@ -226,26 +226,27 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
             return face_tensor
 
         # 4. Fallback jika MTCNN gagal tapi gambar sudah berupa foto wajah pre-cropped
-        aspect = iw / max(ih, 1)
-        if 0.50 <= aspect <= 1.80 and min(iw, ih) >= 60:
-            print(f"   ℹ️ [FaceNet] MTCNN no-face, fallback direct square crop ({iw}x{ih})")
-            max_d = max(iw, ih)
-            pad_w = (max_d - iw) // 2
-            pad_h = (max_d - ih) // 2
-            padded_img = cv2.copyMakeBorder(
-                img_rgb, pad_h, max_d - ih - pad_h, pad_w, max_d - iw - pad_w,
-                cv2.BORDER_REFLECT_101
-            )
-            face_pil = Image.fromarray(padded_img).resize(target_size, Image.LANCZOS)
-            face_arr = np.array(face_pil, dtype='float32')
-            face_norm = (face_arr - 127.5) / 128.0
-            face_tensor = np.expand_dims(face_norm, axis=0)
-            if multi_margin:
-                return face_tensor, face_tensor
-            if return_mirror:
-                face_flip_norm = np.fliplr(face_norm)
-                return face_tensor, np.expand_dims(face_flip_norm, axis=0)
-            return face_tensor
+        if allow_fallback:
+            aspect = iw / max(ih, 1)
+            if 0.50 <= aspect <= 1.80 and min(iw, ih) >= 60:
+                print(f"   ℹ️ [FaceNet] MTCNN no-face, fallback direct square crop ({iw}x{ih})")
+                max_d = max(iw, ih)
+                pad_w = (max_d - iw) // 2
+                pad_h = (max_d - ih) // 2
+                padded_img = cv2.copyMakeBorder(
+                    img_rgb, pad_h, max_d - ih - pad_h, pad_w, max_d - iw - pad_w,
+                    cv2.BORDER_REFLECT_101
+                )
+                face_pil = Image.fromarray(padded_img).resize(target_size, Image.LANCZOS)
+                face_arr = np.array(face_pil, dtype='float32')
+                face_norm = (face_arr - 127.5) / 128.0
+                face_tensor = np.expand_dims(face_norm, axis=0)
+                if multi_margin:
+                    return face_tensor, face_tensor
+                if return_mirror:
+                    face_flip_norm = np.fliplr(face_norm)
+                    return face_tensor, np.expand_dims(face_flip_norm, axis=0)
+                return face_tensor
 
         print(f"   ⚠️ [FaceNet] Tidak ada wajah valid terdeteksi di {os.path.basename(image_path)} (dim: {iw}x{ih})")
         return (None, None) if (return_mirror or multi_margin) else None
@@ -258,13 +259,14 @@ def detect_and_crop_face(image_path, target_size=(160, 160), return_mirror=False
 # ============================================
 # EMBEDDING EXTRACTION
 # ============================================
-def get_embedding(image_path):
+def get_embedding(image_path, allow_fallback=False):
     """
     Mengekstrak embedding 512-dimensi dari wajah yang terdeteksi (single primary).
     Embedding selalu dinormalisasi L2 agar cosine similarity = dot product.
+    Default allow_fallback=False agar foto tanpa wajah terverifikasi MTCNN tidak dijadikan embedding.
     """
     try:
-        face = detect_and_crop_face(image_path, return_mirror=False)
+        face = detect_and_crop_face(image_path, return_mirror=False, allow_fallback=allow_fallback)
         if face is None:
             print(f"   ⚠️ Tidak ada wajah terdeteksi di: {os.path.basename(image_path)}")
             return None
@@ -425,7 +427,7 @@ def register_user_and_generate_embeddings(person_nip, person_name, image_files):
     for i, image_file in enumerate(image_files):
         img_path = os.path.join(person_sample_path, f"{i}.jpg")
         image_file.save(img_path)
-        embedding = get_embedding(img_path)
+        embedding = get_embedding(img_path, allow_fallback=False)
         if embedding is not None:
             embeddings.append(embedding)
             print(f"   ✅ Foto {i+1}: Wajah terdeteksi, embedding berhasil dibuat")
@@ -467,7 +469,7 @@ def refresh_user_embeddings(nip):
     new_embeddings = []
     for fname in sorted(img_files):
         fpath = os.path.join(sample_folder, fname)
-        emb = get_embedding(fpath)
+        emb = get_embedding(fpath, allow_fallback=False)
         if emb is not None:
             new_embeddings.append(emb)
 
@@ -485,16 +487,17 @@ def _auto_refresh_active_users():
     """
     Sinkronisasi embedding dari folder samples/ ke samples_embedding/
     menggunakan pipeline square crop & L2 normalization terbaru.
+    Hanya foto dengan deteksi wajah valid MTCNN yang disimpan.
     """
     try:
         curr_dir = os.getcwd()
         samples_dir = os.path.join(curr_dir, "samples")
         emb_dir = os.path.join(curr_dir, "samples_embedding")
-        marker_file = os.path.join(emb_dir, ".v2_migrated")
+        marker_file = os.path.join(emb_dir, ".v3_clean_migrated")
         if os.path.exists(marker_file) or not os.path.exists(samples_dir):
             return
 
-        print("🔄 [AUTO-SYNC] Memulai sinkronisasi embedding dengan pipeline v2...")
+        print("🔄 [AUTO-SYNC] Memulai sinkronisasi embedding dengan pipeline v3 (clean verified faces)...")
         user_dirs = [d for d in os.listdir(samples_dir) if os.path.isdir(os.path.join(samples_dir, d))]
         if "031188791093271576" in user_dirs:
             user_dirs.remove("031188791093271576")
@@ -507,8 +510,8 @@ def _auto_refresh_active_users():
                 print(f"⚠️ [AUTO-SYNC] Gagal update {nip}: {ue}")
 
         with open(marker_file, "w") as f:
-            f.write("v2_all_users_migrated\n")
-        print("✅ [AUTO-SYNC] Seluruh embedding berhasil dimigrasikan ke pipeline v2.")
+            f.write("v3_all_users_migrated_clean\n")
+        print("✅ [AUTO-SYNC] Seluruh embedding berhasil dimigrasikan ke pipeline v3 (clean).")
     except Exception as e:
         print(f"⚠️ [AUTO-SYNC] Error refresh embedding: {e}")
 

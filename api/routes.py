@@ -565,14 +565,23 @@ def predict_unlock():
     if test_embedding is None:
         return jsonify({"error": "Wajah tidak terdeteksi. Pastikan wajah terlihat jelas."}), 400
 
-    # --- Cari kecocokan di semua embedding ---
+    # --- Cari kecocokan HANYA di antara Admin yang berhak meng-unlock device ini ---
+    # 1. Super Admin: berhak membuka menu di semua kiosk/device
+    # 2. Admin OPD: berhak membuka menu di device instansinya (user.opd_id == device.opd_id)
+    # ASN biasa sama sekali TIDAK dievaluasi demi mencegah false-match blocking.
+    admin_query = User.query.filter(User.role.in_(['super_admin', 'admin_opd']))
+    if device.opd_id:
+        admin_query = admin_query.filter(
+            (User.role == 'super_admin') | (User.opd_id == device.opd_id)
+        )
+    eligible_admins = {u.nip: u for u in admin_query.all() if u.nip}
+
     best_nip, best_name, best_similarity = "unknown", "unknown", 0.0
+    for nip, admin_user in eligible_admins.items():
+        pkl_path = os.path.join(EMBEDDINGS_DIR, nip, f"{nip}.pkl")
+        txt_path = os.path.join(EMBEDDINGS_DIR, nip, f"{nip}.txt")
 
-    for folder_name in os.listdir(EMBEDDINGS_DIR):
-        pkl_path = os.path.join(EMBEDDINGS_DIR, folder_name, f"{folder_name}.pkl")
-        txt_path = os.path.join(EMBEDDINGS_DIR, folder_name, f"{folder_name}.txt")
-
-        if not os.path.exists(pkl_path) or not os.path.exists(txt_path):
+        if not os.path.exists(pkl_path):
             continue
 
         with open(pkl_path, "rb") as f:
@@ -581,20 +590,18 @@ def predict_unlock():
         similarity = compare_faces(test_embedding, known_embeddings, THRESHOLD, test_embedding_flip)
         if similarity > best_similarity:
             best_similarity = similarity
-            best_nip, best_name = read_txt(txt_path)
+            best_nip = nip
+            best_name = admin_user.nama_lengkap
 
     similarity_pct = float(round(best_similarity * 100, 1))
 
     # --- Threshold Check ---
     if best_nip == "unknown" or best_similarity < THRESHOLD:
-        print(f"\n🔒 [UNLOCK] GAGAL — Wajah tidak dikenali | Similarity: {similarity_pct}% | Device: {device_sn}")
-        return jsonify({"unlock": False, "error": "Wajah tidak dikenali."}), 401
+        print(f"\n🔒 [UNLOCK] GAGAL — Wajah Admin tidak cocok | Similarity: {similarity_pct}% | Device: {device_sn}")
+        return jsonify({"unlock": False, "error": "Wajah Admin tidak dikenali atau di bawah batas kemiripan."}), 401
 
-    # --- Role Validation ---
-    user = User.query.filter_by(nip=best_nip).first()
-    if not user:
-        return jsonify({"unlock": False, "error": "User tidak ditemukan di database."}), 404
-
+    # User sudah dipastikan eligible admin dari query di atas
+    user = eligible_admins[best_nip]
     if user.role == 'super_admin':
         print(f"\n🔓 [UNLOCK] OK — Super Admin: {user.nama_lengkap} | Similarity: {similarity_pct}% | Device: {device_sn}")
         return jsonify({
@@ -606,30 +613,19 @@ def predict_unlock():
         }), 200
 
     if user.role == 'admin_opd':
-        # Cek apakah OPD admin cocok dengan OPD device
-        if device.opd_id and user.opd_id == device.opd_id:
-            opd_name = user.opd.nama_opd if user.opd else "-"
-            print(f"\n🔓 [UNLOCK] OK — Admin OPD: {user.nama_lengkap} ({opd_name}) | Similarity: {similarity_pct}% | Device: {device_sn}")
-            return jsonify({
-                "unlock": True,
-                "role": "admin_opd",
-                "name": user.nama_lengkap,
-                "nip": user.nip,
-                "opd_id": user.opd_id,
-                "similarity": similarity_pct,
-            }), 200
-        else:
-            device_opd = MasterOpd.query.get(device.opd_id) if device.opd_id else None
-            device_opd_name = device_opd.nama_opd if device_opd else "Tidak terikat"
-            print(f"\n🔒 [UNLOCK] DITOLAK — {user.nama_lengkap} bukan Admin untuk device ini | User OPD: {user.opd_id} | Device OPD: {device.opd_id} ({device_opd_name})")
-            return jsonify({
-                "unlock": False,
-                "error": f"Anda bukan Admin instansi ini. Device terikat ke: {device_opd_name}.",
-            }), 403
+        opd_name = user.opd.nama_opd if user.opd else "-"
+        print(f"\n🔓 [UNLOCK] OK — Admin OPD: {user.nama_lengkap} ({opd_name}) | Similarity: {similarity_pct}% | Device: {device_sn}")
+        return jsonify({
+            "unlock": True,
+            "role": "admin_opd",
+            "name": user.nama_lengkap,
+            "nip": user.nip,
+            "opd_id": user.opd_id,
+            "similarity": similarity_pct,
+        }), 200
 
-    # ASN atau role lain — tidak boleh unlock
-    print(f"\n🔒 [UNLOCK] DITOLAK — {user.nama_lengkap} (role: {user.role}) bukan Admin | Device: {device_sn}")
-    return jsonify({"unlock": False, "error": "Akses khusus Admin. ASN tidak dapat membuka menu ini."}), 403
+    print(f"\n🔒 [UNLOCK] DITOLAK — {user.nama_lengkap} bukan Admin | Device: {device_sn}")
+    return jsonify({"unlock": False, "error": "Akses khusus Admin."}), 403
 
 # ==========================================
 # 4. DASHBOARD & MANAGE ASN (PERBAIKAN user_pin)
@@ -1107,6 +1103,113 @@ def delete_user(current_user, id):
 # 5. REGISTER Wajah (Cross-OPD + Mobile Support)
 # ==========================================
 
+# ==========================================
+# BIOMETRIC RE-REGISTRATION HANDLER
+# ==========================================
+def _handle_biometric_reregistration(existing_user, target_opd, files, actor_id, source):
+    """
+    Menangani Re-Registrasi Wajah untuk pengguna yang sudah terdaftar di OPD yang sama.
+    Tahap 1: Verifikasi biometrik bahwa wajah baru cocok (>= 70%) dengan wajah terdaftar.
+             Jika cocok, minta konfirmasi dari pengguna (needs_confirmation: True).
+    Tahap 2: Jika konfirmasi diberikan (confirm_reregister: True), perbarui data sample & embedding.
+             Status approval langsung 'approved' (langsung aktif untuk presensi).
+    """
+    person_nip = existing_user.nip
+    confirm_reregister = request.form.get('confirm_reregister', '').lower() in ('true', '1')
+    curr_dir = os.getcwd()
+    pkl_path = os.path.join(curr_dir, "samples_embedding", person_nip, f"{person_nip}.pkl")
+
+    # Jika file embedding belum ada sama sekali di sistem (misal data diimpor tanpa foto)
+    if not os.path.exists(pkl_path):
+        result, status = register_user_and_generate_embeddings(person_nip, existing_user.nama_lengkap, files)
+        if status != 200:
+            return jsonify(result), status
+        existing_user.is_face_registered = True
+        existing_user.approval_status = 'approved'
+        catat_audit(
+            existing_user.id or actor_id or 1, "ENROLL_FACE_FIRST", "users",
+            f"Perekaman wajah perdana {existing_user.nama_lengkap} (NIP: {person_nip}) via {source}",
+            target_record_id=person_nip
+        )
+        db.session.commit()
+        return jsonify({
+            "message": f"Wajah perdana berhasil direkam untuk {existing_user.nama_lengkap} dan langsung aktif!",
+            "nip": person_nip,
+            "role": existing_user.role,
+            "primary_opd": target_opd.nama_opd,
+            "approval_status": "approved"
+        }), 200
+
+    # 1. Ekstrak embedding dari foto pertama yang diunggah untuk verifikasi kemiripan
+    temp_filename = f"verify_{uuid4().hex}.jpg"
+    temp_path = os.path.join(TEMP_DIR, temp_filename)
+    files[0].save(temp_path)
+    test_emb, candidates = get_embeddings(temp_path)
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    files[0].stream.seek(0)  # PENTING: reset stream agar foto bisa disimpan ulang
+
+    if test_emb is None:
+        return jsonify({"error": "Wajah tidak terdeteksi pada foto pendaftaran. Pastikan wajah terlihat jelas dan tegak."}), 400
+
+    with open(pkl_path, "rb") as f:
+        known_embeddings = pickle.load(f)
+
+    # Ambang batas verifikasi identitas re-registrasi: 0.70 (70.0%)
+    similarity = compare_faces(test_emb, known_embeddings, 0.70, candidates)
+    similarity_pct = float(round(similarity * 100, 1))
+
+    # Wajah tidak cocok (< 70%): Tolak demi mencegah penimpaan wajah oleh orang lain
+    if similarity < 0.70:
+        print(f"⚠️ [RE-REGISTER] DITOLAK: NIP {person_nip} wajah tidak cocok (sim: {similarity_pct}%)")
+        return jsonify({
+            "error": f"Verifikasi Biometrik Gagal: Wajah yang dideteksi tidak cocok dengan data biometrik pemilik NIP ini (kemiripan: {similarity_pct}%). Pembaruan wajah ditolak demi keamanan akun."
+        }), 403
+
+    # TAHAP 1: Belum ada konfirmasi dari pengguna -> Tampilkan Reminder / Dialog Konfirmasi di Kiosk
+    if not confirm_reregister:
+        return jsonify({
+            "needs_confirmation": True,
+            "nip": person_nip,
+            "name": existing_user.nama_lengkap,
+            "similarity_pct": similarity_pct,
+            "message": f"NIP {person_nip} sudah terdaftar atas nama {existing_user.nama_lengkap}. Wajah Anda terverifikasi cocok ({similarity_pct}%). Apakah Anda ingin memperbarui data sampel wajah Anda?"
+        }), 200
+
+    # TAHAP 2: Pengguna sudah konfirmasi -> Eksekusi pembaruan sampel & embedding
+    old_embedding_dir = os.path.join(curr_dir, "samples_embedding", person_nip)
+    old_samples_dir = os.path.join(curr_dir, "samples", person_nip)
+    if os.path.exists(old_embedding_dir):
+        shutil.rmtree(old_embedding_dir)
+    if os.path.exists(old_samples_dir):
+        shutil.rmtree(old_samples_dir)
+
+    result, status = register_user_and_generate_embeddings(person_nip, existing_user.nama_lengkap, files)
+    if status != 200:
+        return jsonify(result), status
+
+    existing_user.is_face_registered = True
+    existing_user.approval_status = 'approved'  # Langsung aktif
+
+    catat_audit(
+        existing_user.id or actor_id or 1, "RE_REGISTER_FACE_KIOSK", "users",
+        f"Re-registrasi wajah {existing_user.nama_lengkap} (NIP: {person_nip}) via {source} (kemiripan terverifikasi: {similarity_pct}%)",
+        target_record_id=person_nip
+    )
+    db.session.commit()
+
+    print(f"✅ [RE-REGISTER] SUKSES: Wajah {existing_user.nama_lengkap} ({person_nip}) diperbarui via {source} & langsung aktif.")
+    return jsonify({
+        "message": f"Data sampel wajah {existing_user.nama_lengkap} berhasil diperbarui dan langsung aktif untuk presensi!",
+        "nip": person_nip,
+        "role": existing_user.role,
+        "primary_opd": target_opd.nama_opd,
+        "approval_status": "approved",
+        "is_reregister": True,
+        "similarity_pct": similarity_pct
+    }), 200
+
+
 def _process_registration(person_nip, person_name, files, target_opd_id, source, actor_id=None, role='ASN'):
     """
     Logika inti registrasi wajah. Dipanggil oleh register_web (JWT) dan register_mobile (Device SN).
@@ -1135,7 +1238,10 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
         # Cek duplikat: apakah NIK sudah terdaftar?
         existing_user = User.query.filter_by(nip=person_nip).first()
         if existing_user:
-            return jsonify({"error": "Gagal: NIK ini sudah terdaftar di sistem."}), 400
+            if existing_user.opd_id == target_opd_id:
+                return _handle_biometric_reregistration(existing_user, target_opd, files, actor_id, source)
+            else:
+                return jsonify({"error": "Gagal: NIK ini sudah terdaftar di instansi lain."}), 400
 
         # Generate face embeddings
         result, status = register_user_and_generate_embeddings(person_nip, person_name, files)
@@ -1225,12 +1331,10 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
         }), 200
 
     # =============================================
-    # CONDITION B: User Sudah Ada, OPD Sama → Tolak
+    # CONDITION B: User Sudah Ada, OPD Sama → Biometric Re-Registration
     # =============================================
     if existing_user.opd_id == target_opd_id:
-        return jsonify({
-            "error": "Gagal: ASN dengan NIP ini sudah terdaftar di instansi ini."
-        }), 400
+        return _handle_biometric_reregistration(existing_user, target_opd, files, actor_id, source)
 
     # Cek juga di tabel akses lintas instansi
     existing_akses = UserAksesOpd.query.filter_by(
