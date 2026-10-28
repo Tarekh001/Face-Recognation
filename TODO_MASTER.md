@@ -89,17 +89,17 @@ ADD COLUMN IF NOT EXISTS foto_presensi TEXT;
 **Tujuan:** Setiap pegawai yang berhasil melakukan scan wajah di Kiosk otomatis tercatat fotonya sebagai bukti fisik pada laporan harian.
 
 ### Checklist Pengerjaan:
-- [ ] **Backend API Presensi (`/predict` di `api/routes.py`):**
+- [x] **Backend API Presensi (`/predict` di `api/routes.py`):** (SELESAI - Terverifikasi)
   - Ketika wajah teridentifikasi (`MATCH`), proses file `photo` yang dikirim Kiosk.
   - Kompresi gambar menggunakan Pillow/OpenCV ke format **WebP** (resolusi maks lebar 480px, kualitas 70%, target ukuran ~25–40 KB).
   - Simpan ke struktur folder bertingkat:
     `/static/uploads/presensi/YYYY/MM/DD/{nip}_{tipe}_{timestamp}.webp`
   - Simpan relative path foto tersebut ke kolom `presensi.foto_presensi`.
-- [ ] **Frontend React Dashboard (`ReportAsn.jsx` & `ReportNonAsn.jsx`):**
-  - Tambahkan kolom **"Foto Bukti"** di tabel laporan harian.
-  - Tampilkan thumbnail foto kecil (lingkaran/persegi sudut melengkung 40x40px).
-  - Pasang handler `onError` pada tag `<img />` untuk menampilkan inisial avatar jika foto tidak tersedia (misal data presensi lama atau dinas luar).
-  - Tambahkan interaksi: ketika thumbnail diklik, buka Modal Popup menampilkan foto ukuran asli lengkap dengan stempel waktu, lokasi kiosk, dan status kehadiran.
+- [x] **Frontend React Dashboard (`Dashboard.jsx`, `ReportAsn.jsx`, & `ReportNonAsn.jsx`):** (SELESAI - Terverifikasi)
+  - Tambahkan kolom **"Foto Bukti"** di tabel laporan harian & Dashboard Utama (`Super Admin` maupun `Admin OPD`).
+  - Tampilkan thumbnail foto kecil (`PhotoThumbnail`) untuk Masuk & Pulang dengan fallback elegan jika belum tersedia.
+  - Tambahkan interaksi: ketika thumbnail diklik, buka Modal Popup (`AttendanceProofModal`) menampilkan foto ukuran asli lengkap dengan stempel waktu, lokasi kiosk, dan status kehadiran.
+  - Perbaikan akurasi Summary KPI Cards (`summary.total`, `on_time`, `late`, `absent`) berbasis total global server (tidak terpotong pagination 25 baris) serta penyertaan pegawai ASN pemegang hak `admin_opd` di laporan harian ASN.
 
 ---
 

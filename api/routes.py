@@ -31,6 +31,43 @@ def get_wib_time():
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def _save_presensi_photo_webp(source_image_path, nip, tipe_absen, dt_scan):
+    """
+    Kompresi foto bukti presensi harian ke format WebP (lebar maks 480px, quality=70, ~25-40 KB)
+    dan simpan ke folder bertingkat: /static/uploads/presensi/YYYY/MM/DD/{nip}_{tipe}_{timestamp}.webp
+    Mengembalikan relative URL path untuk disimpan ke kolom presensi.foto_presensi.
+    """
+    try:
+        from PIL import Image, ImageOps
+        yyyy = dt_scan.strftime("%Y")
+        mm = dt_scan.strftime("%m")
+        dd = dt_scan.strftime("%d")
+        ts_str = dt_scan.strftime("%H%M%S")
+
+        rel_dir = f"/static/uploads/presensi/{yyyy}/{mm}/{dd}"
+        abs_dir = os.path.join(os.getcwd(), "static", "uploads", "presensi", yyyy, mm, dd)
+        os.makedirs(abs_dir, exist_ok=True)
+
+        filename = f"{nip}_{tipe_absen}_{ts_str}.webp"
+        abs_path = os.path.join(abs_dir, filename)
+
+        with Image.open(source_image_path) as pil_img:
+            pil_img = ImageOps.exif_transpose(pil_img)
+            if pil_img.mode not in ("RGB", "RGBA"):
+                pil_img = pil_img.convert("RGB")
+            max_width = 480
+            if pil_img.width > max_width:
+                ratio = max_width / float(pil_img.width)
+                new_height = max(1, int(pil_img.height * ratio))
+                resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
+                pil_img = pil_img.resize((max_width, new_height), resample_filter)
+            pil_img.save(abs_path, format="WEBP", quality=70, method=4)
+
+        return f"{rel_dir}/{filename}"
+    except Exception as err:
+        print(f"⚠️ [FotoPresensi] Gagal kompresi/simpan WebP untuk {nip}: {err}")
+        return None
+
 def calculate_haversine(lat1, lon1, lat2, lon2):
     """
     Hitung jarak antara dua titik koordinat menggunakan rumus Haversine.
@@ -475,14 +512,22 @@ def predict():
                     delta = now - batas_dt
                     keterlambatan_menit = int(delta.total_seconds() // 60)
 
-            # 4. Simpan ke Database
+            # 4. Kompresi Foto Bukti Presensi (WebP ~30 KB) & Simpan ke Database
+            foto_url = _save_presensi_photo_webp(image_path, attendance_id, status_absen, now)
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            except Exception:
+                pass
+
             new_log = Presensi(
                 user_pin=attendance_id,
                 device_sn=device_klien_sn,
                 waktu_scan=now,
                 tipe_absen=status_absen,
                 status_kehadiran=status_kehadiran,
-                keterlambatan_menit=keterlambatan_menit
+                keterlambatan_menit=keterlambatan_menit,
+                foto_presensi=foto_url
             )
             db.session.add(new_log)
             db.session.commit()
@@ -490,7 +535,7 @@ def predict():
             late_info = f" | Terlambat: {keterlambatan_menit} menit" if status_kehadiran == "LATE" else ""
             sync_tag = " [OFFLINE-SYNC]" if is_offline_sync else ""
             print(f"\n🟢 [FACE-AI]{sync_tag} MATCH: {best_name} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Status: {status_absen} | {status_kehadiran}{late_info}")
-            print(f"   ↳ Waktu: {now.strftime('%H:%M:%S')} | Device: {device_klien_sn} | AttendanceID: {attendance_id}\n")
+            print(f"   ↳ Waktu: {now.strftime('%H:%M:%S')} | Device: {device_klien_sn} | AttendanceID: {attendance_id} | Foto: {foto_url or '-'}\n")
             
             return jsonify({
                 "nip": best_nip,
@@ -499,6 +544,7 @@ def predict():
                 "status_kehadiran": status_kehadiran,
                 "keterlambatan_menit": keterlambatan_menit,
                 "waktu": now.strftime("%H:%M:%S"),
+                "foto_presensi": foto_url,
                 "is_offline_sync": is_offline_sync
             }), 200
 
@@ -630,6 +676,16 @@ def predict_unlock():
 # ==========================================
 # 4. DASHBOARD & MANAGE ASN (PERBAIKAN user_pin)
 # ==========================================
+def _is_employee_account(u):
+    """Exclude pure web-operator login accounts (e.g. email in user_nip without face registration)."""
+    if u is None:
+        return False
+    nip_val = (u.nip or '').strip()
+    if '@' in nip_val and not u.is_face_registered:
+        return False
+    return True
+
+
 @api_blueprint.route('/report', methods=['GET'])
 @token_required
 def get_report(current_user):
@@ -644,6 +700,19 @@ def get_report(current_user):
     status_filter = request.args.get('status_filter', '', type=str).strip().upper()
     kegiatan_id_filter = request.args.get('kegiatan_id', type=int)  # Optional: filter by kegiatan
     role_filter = request.args.get('role', '', type=str).lower()
+    opd_id_filter = request.args.get('opd_id', type=int)  # Optional OPD filter for super_admin
+
+    # Map employment category: 'asn' includes ASN employees elevated to admin_opd / super_admin
+    if role_filter == 'asn':
+        target_roles = ['asn', 'admin_opd', 'super_admin']
+    elif role_filter == 'non_asn':
+        target_roles = ['non_asn']
+    elif role_filter:
+        target_roles = [role_filter]
+    else:
+        target_roles = None
+
+    effective_opd_id = current_user.opd_id if current_user.role == 'admin_opd' else opd_id_filter
 
     today = get_wib_time().date()
     try:
@@ -675,12 +744,12 @@ def get_report(current_user):
     if kegiatan_id_filter:
         presensi_q = presensi_q.filter(Presensi.kegiatan_id == kegiatan_id_filter)
         
-    # Filter by role (ASN / Non-ASN)
-    if role_filter:
+    # Filter by role category (ASN / Non-ASN)
+    if target_roles:
         presensi_q = presensi_q.join(
             User,
             db.or_(Presensi.user_pin == User.nip, Presensi.user_pin == User.pin)
-        ).filter(User.role == role_filter)
+        ).filter(User.role.in_(target_roles))
         
     if current_user.role == 'admin_opd':
         opd_device_sns = [d.sn for d in Device.query.filter_by(opd_id=current_user.opd_id).all()]
@@ -701,13 +770,36 @@ def get_report(current_user):
         # user_pin now stores NIP/NIK (from /predict's best_nip). Try nip first, then pin.
         user = User.query.filter_by(nip=uid).first() or User.query.filter_by(pin=uid).first()
         user_role = user.role if user else 'asn'
+        user_opd_id = user.opd_id if user else None
+        user_opd_nama = (user.opd.nama_opd if user and user.opd else None)
         pegawai = DataPegawai.query.filter_by(nip=uid).first() or DataPegawai.query.filter_by(pin=uid).first()
         if pegawai:
-            pin_identity[uid] = {"nip": pegawai.nip, "nama": pegawai.nama_lengkap, "role": user_role}
+            pin_identity[uid] = {
+                "nip": pegawai.nip,
+                "pin": user.pin if user else pegawai.pin,
+                "nama": pegawai.nama_lengkap,
+                "role": user_role,
+                "opd_id": user_opd_id,
+                "nama_opd": user_opd_nama,
+            }
         elif user:
-            pin_identity[uid] = {"nip": user.nip or uid, "nama": user.nama_lengkap, "role": user_role}
+            pin_identity[uid] = {
+                "nip": user.nip or uid,
+                "pin": user.pin,
+                "nama": user.nama_lengkap,
+                "role": user_role,
+                "opd_id": user_opd_id,
+                "nama_opd": user_opd_nama,
+            }
         else:
-            pin_identity[uid] = {"nip": uid, "nama": f"Unknown ({uid})", "role": "asn"}
+            pin_identity[uid] = {
+                "nip": uid,
+                "pin": uid,
+                "nama": f"Unknown ({uid})",
+                "role": "asn",
+                "opd_id": None,
+                "nama_opd": None,
+            }
 
     # ────────────────────────────────────────────────────────
     # STEP 3: Index logs by (pin, date) and group IN/OUT
@@ -717,9 +809,14 @@ def get_report(current_user):
         key = (log.user_pin, log.waktu_scan.date())
         logs_index.setdefault(key, []).append(log)
 
+    existing_keys = set(logs_index.keys())
     report_data = []
     for (pin, log_date), logs in logs_index.items():
         identity = pin_identity.get(pin, {"nip": pin, "nama": f"Unknown ({pin})"})
+        if identity.get("nip"):
+            existing_keys.add((identity["nip"], log_date))
+        if identity.get("pin"):
+            existing_keys.add((identity["pin"], log_date))
 
         in_logs = [l for l in logs if l.tipe_absen == 'IN']
         out_logs = [l for l in logs if l.tipe_absen == 'OUT']
@@ -733,10 +830,16 @@ def get_report(current_user):
             mesin = SnMesin.query.get(active_sn)
             lokasi = mesin.nama_lokasi if mesin else None
 
+        foto_masuk_url = getattr(earliest_in, 'foto_presensi', None) if earliest_in else None
+        foto_keluar_url = getattr(latest_out, 'foto_presensi', None) if latest_out else None
+        primary_foto_url = foto_masuk_url or foto_keluar_url
+
         report_data.append({
             "nip": identity["nip"],
             "nama": identity["nama"],
             "role": identity.get("role", "asn"),
+            "opd_id": identity.get("opd_id"),
+            "nama_opd": identity.get("nama_opd"),
             "tanggal": log_date.strftime("%Y-%m-%d"),
             "jam_masuk": earliest_in.waktu_scan.strftime("%H:%M:%S") if earliest_in else None,
             "status_masuk": earliest_in.status_kehadiran if earliest_in else None,
@@ -745,14 +848,16 @@ def get_report(current_user):
             "status_keluar": "CHECKED_OUT" if latest_out else "MISSING",
             "device_sn": active_sn,
             "nama_lokasi": lokasi,
+            "foto_presensi": primary_foto_url,
+            "foto_masuk": foto_masuk_url,
+            "foto_keluar": foto_keluar_url,
         })
 
-    # SECURITY FIX: Enforce tenant isolation on presensi-derived rows
-    # For admin_opd: restrict to employees who belong to THEIR OPD
-    if current_user.role == 'admin_opd':
+    # SECURITY FIX: Enforce tenant isolation / OPD filter on presensi-derived rows
+    if effective_opd_id:
         opd_nips = set(
-            u.nip for u in User.query.filter_by(opd_id=current_user.opd_id).all()
-            if u.nip
+            u.nip for u in User.query.filter_by(opd_id=effective_opd_id).all()
+            if u.nip and _is_employee_account(u)
         )
         report_data = [r for r in report_data if str(r['nip']) in opd_nips]
 
@@ -762,23 +867,20 @@ def get_report(current_user):
         report_data = [r for r in report_data if str(r['nip']) in enrolled_set]
 
     # ────────────────────────────────────────────────────────
-    # STEP 4: Generate virtual ABSENT rows for ALL users
-    #         (Admin + ASN — anyone who should be present)
+    # STEP 4: Generate virtual ABSENT rows for ALL real employees
+    #         (Admin OPD ASN + ASN + Non-ASN according to filter)
     # ────────────────────────────────────────────────────────
     known_users_q = User.query
-    if current_user.role == 'admin_opd':
-        known_users_q = known_users_q.filter_by(opd_id=current_user.opd_id)
-    # ── Apply role filter to ABSENT generator too ──
-    if role_filter:
-        known_users_q = known_users_q.filter(User.role == role_filter)
-    known_users = known_users_q.all()
+    if effective_opd_id:
+        known_users_q = known_users_q.filter_by(opd_id=effective_opd_id)
+    if target_roles:
+        known_users_q = known_users_q.filter(User.role.in_(target_roles))
+    known_users = [u for u in known_users_q.all() if _is_employee_account(u)]
 
     # SECURITY FIX: When kegiatan_id is set, intersect enrolled NIPs with OPD scope
-    # Ensures: "employees in enrolled_nips AND whose opd_id equals Admin's opd_id"
     if enrolled_nips is not None:
         known_users = [u for u in known_users if (u.nip or '') in enrolled_nips]
 
-    existing_keys = set(logs_index.keys())
     id_holidays_cache = {}
 
     # Pre-load custom holidays for the date range
@@ -805,7 +907,12 @@ def get_report(current_user):
                 attendance_id = u.nip if u.nip else u.pin
                 if not attendance_id:
                     continue
-                if (attendance_id, current_date) not in existing_keys:
+                already_logged = (
+                    (attendance_id, current_date) in existing_keys
+                    or (u.nip and (u.nip, current_date) in existing_keys)
+                    or (u.pin and (u.pin, current_date) in existing_keys)
+                )
+                if not already_logged:
                     identity = pin_identity.get(attendance_id)
                     if not identity:
                         identity = {"nip": u.nip or attendance_id, "nama": u.nama_lengkap}
@@ -813,6 +920,8 @@ def get_report(current_user):
                         "nip": identity["nip"],
                         "nama": identity["nama"],
                         "role": u.role,
+                        "opd_id": u.opd_id,
+                        "nama_opd": u.opd.nama_opd if u.opd else None,
                         "tanggal": current_date.strftime("%Y-%m-%d"),
                         "jam_masuk": None,
                         "status_masuk": "ABSENT",
@@ -821,6 +930,9 @@ def get_report(current_user):
                         "status_keluar": "MISSING",
                         "device_sn": None,
                         "nama_lokasi": None,
+                        "foto_presensi": None,
+                        "foto_masuk": None,
+                        "foto_keluar": None,
                     })
         current_date += timedelta(days=1)
 
@@ -830,6 +942,17 @@ def get_report(current_user):
     if search_query:
         sq = search_query.lower()
         report_data = [r for r in report_data if sq in r['nama'].lower() or sq in str(r['nip']).lower()]
+
+    # ────────────────────────────────────────────────────────
+    # STEP 5.5: Global Summary Counts (across ALL matching records, BEFORE pagination & status_filter)
+    # ────────────────────────────────────────────────────────
+    summary = {
+        "total": len(report_data),
+        "on_time": sum(1 for r in report_data if r.get("status_masuk") == "ON_TIME"),
+        "late": sum(1 for r in report_data if r.get("status_masuk") == "LATE"),
+        "absent": sum(1 for r in report_data if r.get("status_masuk") == "ABSENT"),
+        "checked_out": sum(1 for r in report_data if bool(r.get("jam_keluar"))),
+    }
 
     # ────────────────────────────────────────────────────────
     # STEP 6: Status filter
@@ -860,20 +983,25 @@ def get_report(current_user):
         "data": paginated_data,
         "total_pages": total_pages,
         "current_page": page,
-        "total_records": total_records
+        "total_records": total_records,
+        "summary": summary,
+        "period": {
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "end_date": end_date.strftime("%Y-%m-%d"),
+        }
     }), 200
 
 @api_blueprint.route('/manage-asn', methods=['GET'])
 @token_required
 def get_manage_asn(current_user):
-    today = datetime.now().date()
+    today = get_wib_time().date()
     role_filter = request.args.get('role', '', type=str).lower()
 
-    # ── Fetch ALL users (ASN + Admin + Super Admin) ──
+    # ── Fetch ALL real employee users (ASN + Admin OPD + Non-ASN) ──
     # Admins are employees too — they need attendance monitoring.
     # Security is enforced via the `is_manageable` flag, not by hiding data.
     if current_user.role == 'super_admin':
-        users = User.query.all()
+        users = [u for u in User.query.all() if _is_employee_account(u)]
     else:
         # admin_opd: Users in my OPD + users with cross-OPD access to my OPD
         primary_users = User.query.filter_by(opd_id=current_user.opd_id).all()
@@ -888,11 +1016,15 @@ def get_manage_asn(current_user):
         seen_ids = set()
         users = []
         for u in primary_users + cross_users:
-            if u.id not in seen_ids:
+            if u.id not in seen_ids and _is_employee_account(u):
                 seen_ids.add(u.id)
                 users.append(u)
 
-    if role_filter:
+    if role_filter == 'asn':
+        users = [u for u in users if u.role in ('asn', 'admin_opd', 'super_admin')]
+    elif role_filter == 'non_asn':
+        users = [u for u in users if u.role == 'non_asn']
+    elif role_filter:
         users = [u for u in users if u.role == role_filter]
 
     data_asn = []

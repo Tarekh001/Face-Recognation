@@ -33,6 +33,13 @@ db.init_app(app)
 
 with app.app_context():
     # db.create_all()  # Dimatikan karena pakai skema SQL manual via DBeaver
+    try:
+        from sqlalchemy import text
+        db.session.execute(text("ALTER TABLE presensi ADD COLUMN IF NOT EXISTS foto_presensi TEXT;"))
+        db.session.commit()
+    except Exception as _schema_err:
+        db.session.rollback()
+        print(f"⚠️ [Schema] Peringatan cek kolom foto_presensi: {_schema_err}")
     print(f"Database PostgreSQL ({_db_host}:{_db_port}/{_db_name}) berhasil terhubung")
 
 # =======================================================

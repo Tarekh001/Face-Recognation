@@ -26,6 +26,7 @@ scratch/
 migrations/
 
 # 5. File Temporary & Log
+static/
 temp/
 *.log
 

@@ -134,10 +134,11 @@ class Presensi(db.Model):
     tipe_absen = db.Column(db.String(10), nullable=False) 
     status_kehadiran = db.Column(db.String(20), default='ON_TIME')
     keterlambatan_menit = db.Column(db.Integer, default=0)
-    # ── Kolom baru untuk Jadwal Kegiatan (Geofencing) ──
+    # ── Kolom baru untuk Jadwal Kegiatan (Geofencing) & Bukti Foto Harian ──
     latitude_scan = db.Column(db.Float, nullable=True)
     longitude_scan = db.Column(db.Float, nullable=True)
     kegiatan_id = db.Column(db.Integer, db.ForeignKey('jadwal_kegiatan.id'), nullable=True)
+    foto_presensi = db.Column(db.Text, nullable=True)
 
 # 7. Tabel Pengaturan Sistem (Key-Value)
 class AppSetting(db.Model):
