@@ -143,3 +143,19 @@ Jika pada tanggal tertentu seorang pegawai belum di-plot pada tabel `roster_jadw
   - Membandingkan jam scan dengan profil shift yang bersangkutan (bukan jam 08:00 global).
   - Menyesuaikan penentuan status `ABSENT` (hanya menandai alpa jika pegawai dijadwalkan masuk di roster pada hari tersebut).
   - Menambahkan filter pencarian berdasarkan jenis jam kerja/shift.
+
+---
+
+## 5. Status Implementasi & Checklist Verifikasi (SELESAI 100%)
+- [x] **Skema Database PostgreSQL & Auto-Seeding (`migrations/add_jam_kerja_shift.sql`, `models.py`, `app.py`):**
+  - Tabel `master_jam_kerja`, `roster_jadwal_shift`, kolom `users.jam_kerja_id`, `presensi.tanggal_tugas`, dan `presensi.jam_kerja_id` berhasil dimigrasikan secara idempoten.
+  - 4 Profil Shift Default (*Reguler ASN*, *Shift Pagi Operasional*, *Shift Siang Operasional*, dan *Shift Malam Lintas Hari*) otomatis di-seed.
+- [x] **5 Core Shift Rules di Backend (`api/routes.py`):**
+  - **Rule 1 (Cut-Off Missing Check-Out):** Otomatis menandai `status_keluar = 'MISSING_OUT'` (*Tidak Absen Pulang*) apabila melewati batas `akhir_scan_pulang`.
+  - **Rule 2 (Overnight Paradox / Lintas Hari):** Scan pulang pagi hari pada shift `is_lintas_hari = True` otomatis dipetakan ke `tanggal_tugas` hari sebelumnya (`yesterday`).
+  - **Rule 3 (Centralized Grace Period):** Perhitungan `ON_TIME` vs `LATE` (`keterlambatan_menit`) mengacu pada `jam_masuk + menit_toleransi` dari shift aktif tanggal tersebut.
+  - **Rule 4 (Dinas Luar Override):** Kehadiran pada `PresensiKegiatan` (`jadwal_kegiatan`) otomatis meng-override status kehadiran harian menjadi `ON_TIME` + `DINAS_LUAR`.
+  - **Rule 5 (Relocated Holiday Validation & `abaikan_libur`):** Pengecekan akhir pekan & hari libur nasional di `/api/predict` dipindahkan ke bawah setelah wajah & shift pegawai teridentifikasi, sehingga petugas dengan `abaikan_libur = True` tetap dapat melakukan presensi di hari libur.
+- [x] **Frontend Portal Web (`JamKerjaPage.jsx`, `Dashboard.jsx`, `ReportAsn.jsx`, `ReportNonAsn.jsx`, `ManageASN.jsx`, `ManageNonASN.jsx`):**
+  - Halaman `/jam-kerja` dengan 3 tab: **Master Profil Jam Kerja**, **Penugasan Shift Default Pegawai (Single & Bulk Assign)**, dan **Kalender Roster Bulanan (Kuas Klik Cepat, Plotting Rentang Tanggal, & Tukar Jaga)**.
+  - Filter dropdown **Shift Jam Kerja** serta badge informasi Shift, Lintas Hari (`🌙`), `Dinas Luar`, dan `Tidak Absen Pulang` di seluruh tabel laporan dan personel.

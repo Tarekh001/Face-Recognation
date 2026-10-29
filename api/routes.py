@@ -4,7 +4,7 @@ import pickle
 import math
 import jwt
 import shutil
-from models import db, User, Presensi, MasterOpd, AuditLog, Device, SnMesin, UserAksesOpd, DataPegawai, UserAdmin, AppSetting, HariLiburCustom, JadwalKegiatan, UndanganKegiatan, PresensiKegiatan
+from models import db, User, Presensi, MasterOpd, AuditLog, Device, SnMesin, UserAksesOpd, DataPegawai, UserAdmin, AppSetting, HariLiburCustom, JadwalKegiatan, UndanganKegiatan, PresensiKegiatan, MasterJamKerja, RosterJadwalShift
 from functools import wraps
 from flask import Blueprint, request, jsonify
 from api.facenet_utils import get_embedding, get_embeddings, compare_faces, read_txt, is_valid_image, register_user_and_generate_embeddings
@@ -339,7 +339,167 @@ def check_spoof():
 
 
 # ==========================================
-# 3. PREDICT Wajah (PERBAIKAN user_pin)
+# HELPER SHIFT & JAM KERJA (5 CORE SHIFT RULES)
+# ==========================================
+def _parse_time_val(val, fallback_h=0, fallback_m=0):
+    if isinstance(val, time_type):
+        return val
+    try:
+        parts = str(val).strip().split(':')
+        return time_type(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+    except Exception:
+        return time_type(fallback_h, fallback_m)
+
+
+def _add_minutes_to_time(t_val, minutes):
+    dt_dummy = datetime(2026, 1, 1, t_val.hour, t_val.minute, t_val.second) + timedelta(minutes=int(minutes or 0))
+    return dt_dummy.time()
+
+
+def _serialize_shift_json(s):
+    d = _shift_model_to_dict(s)
+    for k in ('jam_masuk', 'jam_pulang', 'mulai_scan_masuk', 'akhir_scan_masuk', 'mulai_scan_pulang', 'akhir_scan_pulang', 'batas_masuk'):
+        if isinstance(d.get(k), time_type):
+            d[k] = d[k].strftime('%H:%M')
+    return d
+
+def _shift_model_to_dict(s, source="DEFAULT_USER", keterangan=None):
+    batas_masuk = _add_minutes_to_time(s.jam_masuk, s.menit_toleransi or 0)
+    return {
+        "id": s.id,
+        "nama_shift": s.nama_shift,
+        "jam_masuk": s.jam_masuk,
+        "jam_pulang": s.jam_pulang,
+        "jam_masuk_str": s.jam_masuk.strftime("%H:%M"),
+        "jam_pulang_str": s.jam_pulang.strftime("%H:%M"),
+        "jam_baku": f"{s.jam_masuk.strftime('%H:%M')} - {s.jam_pulang.strftime('%H:%M')}",
+        "mulai_scan_masuk": s.mulai_scan_masuk,
+        "akhir_scan_masuk": s.akhir_scan_masuk,
+        "mulai_scan_pulang": s.mulai_scan_pulang,
+        "akhir_scan_pulang": s.akhir_scan_pulang,
+        "mulai_scan_masuk_str": s.mulai_scan_masuk.strftime("%H:%M"),
+        "akhir_scan_masuk_str": s.akhir_scan_masuk.strftime("%H:%M"),
+        "mulai_scan_pulang_str": s.mulai_scan_pulang.strftime("%H:%M"),
+        "akhir_scan_pulang_str": s.akhir_scan_pulang.strftime("%H:%M"),
+        "menit_toleransi": int(s.menit_toleransi or 0),
+        "batas_masuk": batas_masuk,
+        "batas_masuk_str": batas_masuk.strftime("%H:%M"),
+        "is_lintas_hari": bool(s.is_lintas_hari),
+        "abaikan_libur": bool(s.abaikan_libur),
+        "opd_id": s.opd_id,
+        "nama_opd": s.opd.nama_opd if s.opd else "Global (Seluruh OPD)",
+        "source": source,
+        "keterangan": keterangan,
+    }
+
+
+def _get_global_fallback_shift_dict():
+    """
+    Fallback jika pegawai belum dipetakan ke master_jam_kerja:
+    Gunakan profil 'Reguler' di master_jam_kerja (jika ada) yang disinkronkan dengan AppSetting.
+    """
+    jam_masuk_mulai  = _parse_time_val(AppSetting.get('JAM_MASUK_MULAI',  '06:00:00'), 6, 0)
+    batas_terlambat  = _parse_time_val(AppSetting.get('BATAS_TERLAMBAT',  '08:00:00'), 8, 0)
+    jam_masuk_akhir  = _parse_time_val(AppSetting.get('JAM_MASUK_AKHIR',  '12:00:00'), 12, 0)
+    jam_keluar_mulai = _parse_time_val(AppSetting.get('JAM_KELUAR_MULAI', '15:00:00'), 15, 0)
+    jam_keluar_akhir = _parse_time_val(AppSetting.get('JAM_KELUAR_AKHIR', '20:00:00'), 20, 0)
+
+    first_global = MasterJamKerja.query.filter_by(opd_id=None, is_lintas_hari=False).order_by(MasterJamKerja.id.asc()).first()
+    shift_id = first_global.id if first_global else None
+    nama_shift = first_global.nama_shift if first_global else "Reguler ASN"
+    jam_masuk_baku = first_global.jam_masuk if first_global else time_type(7, 30)
+    jam_pulang_baku = first_global.jam_pulang if first_global else time_type(16, 0)
+
+    return {
+        "id": shift_id,
+        "nama_shift": nama_shift,
+        "jam_masuk": jam_masuk_baku,
+        "jam_pulang": jam_pulang_baku,
+        "jam_masuk_str": jam_masuk_baku.strftime("%H:%M"),
+        "jam_pulang_str": jam_pulang_baku.strftime("%H:%M"),
+        "jam_baku": f"{jam_masuk_baku.strftime('%H:%M')} - {jam_pulang_baku.strftime('%H:%M')}",
+        "mulai_scan_masuk": jam_masuk_mulai,
+        "akhir_scan_masuk": jam_masuk_akhir,
+        "mulai_scan_pulang": jam_keluar_mulai,
+        "akhir_scan_pulang": jam_keluar_akhir,
+        "mulai_scan_masuk_str": jam_masuk_mulai.strftime("%H:%M"),
+        "akhir_scan_masuk_str": jam_masuk_akhir.strftime("%H:%M"),
+        "mulai_scan_pulang_str": jam_keluar_mulai.strftime("%H:%M"),
+        "akhir_scan_pulang_str": jam_keluar_akhir.strftime("%H:%M"),
+        "menit_toleransi": 0,
+        "batas_masuk": batas_terlambat,
+        "batas_masuk_str": batas_terlambat.strftime("%H:%M"),
+        "is_lintas_hari": False,
+        "abaikan_libur": False,
+        "opd_id": None,
+        "nama_opd": "Global (Seluruh OPD)",
+        "source": "GLOBAL_DEFAULT",
+        "keterangan": None,
+    }
+
+
+def _resolve_active_shift(user, target_date, roster_lookup=None, shifts_by_id=None, global_fallback=None):
+    """
+    Prioritas Penentuan Shift Pegawai pada `target_date`:
+      1. Roster Jadwal Shift (`roster_jadwal_shift`) pada tanggal tersebut
+      2. Default Shift Pegawai (`users.jam_kerja_id`)
+      3. Fallback Global Default (`AppSetting` / Reguler ASN)
+    """
+    if user:
+        if roster_lookup is not None:
+            r_entry = roster_lookup.get((user.id, target_date))
+            if r_entry:
+                s_obj = shifts_by_id.get(r_entry.jam_kerja_id) if shifts_by_id else r_entry.jam_kerja
+                if s_obj:
+                    return _shift_model_to_dict(s_obj, source="ROSTER", keterangan=r_entry.keterangan)
+        else:
+            r_entry = RosterJadwalShift.query.filter_by(user_id=user.id, tanggal=target_date).first()
+            if r_entry and r_entry.jam_kerja:
+                return _shift_model_to_dict(r_entry.jam_kerja, source="ROSTER", keterangan=r_entry.keterangan)
+
+        if user.jam_kerja_id:
+            s_obj = shifts_by_id.get(user.jam_kerja_id) if shifts_by_id else user.jam_kerja_default
+            if s_obj:
+                return _shift_model_to_dict(s_obj, source="DEFAULT_USER")
+
+    return global_fallback if global_fallback else _get_global_fallback_shift_dict()
+
+
+def _check_date_holiday(target_date, id_holidays_cache=None, custom_holiday_map=None):
+    """
+    Mengecek apakah `target_date` adalah akhir pekan, hari libur custom, atau libur nasional.
+    Returns: (is_holiday: bool, reason_code: str|None, label: str|None)
+    """
+    if target_date.weekday() >= 5:
+        hari = "Sabtu" if target_date.weekday() == 5 else "Minggu"
+        return True, "WEEKEND", f"Hari Libur Akhir Pekan ({hari})"
+
+    if custom_holiday_map is not None:
+        ket = custom_holiday_map.get(target_date)
+        if ket:
+            return True, "CUSTOM_HOLIDAY", ket
+    else:
+        libur_custom = HariLiburCustom.query.filter_by(tanggal=target_date).first()
+        if libur_custom:
+            return True, "CUSTOM_HOLIDAY", libur_custom.keterangan
+
+    yr = target_date.year
+    if id_holidays_cache is not None:
+        if yr not in id_holidays_cache:
+            id_holidays_cache[yr] = holidays.Indonesia(years=yr)
+        id_hols = id_holidays_cache[yr]
+    else:
+        id_hols = holidays.Indonesia(years=yr)
+
+    if target_date in id_hols:
+        nama_libur = id_hols.get(target_date)
+        return True, "HOLIDAY", f"Hari Libur Nasional — {nama_libur}"
+
+    return False, None, None
+
+
+# ==========================================
+# 3. PREDICT Wajah (Multi-Shift & 5 Core Shift Rules)
 # ==========================================
 @api_blueprint.route('/predict', methods=['POST'])
 def predict():
@@ -355,36 +515,6 @@ def predict():
             "message": "Perangkat telah diputus aksesnya oleh server. Silakan aktivasi ulang."
         }), 403
 
-    # ── WORKING DAY VALIDATION (Dynamic from DB) ──
-    now_dt = datetime.now()
-    today_date = now_dt.date()
-    current_time = now_dt.time()
-
-    # Cek akhir pekan
-    if today_date.weekday() >= 5:
-        hari = "Sabtu" if today_date.weekday() == 5 else "Minggu"
-        print(f"\n🚫 [PREDICT] DITOLAK — Hari libur akhir pekan ({hari}) | Device: {device_klien_sn}")
-        return jsonify({"error": f"Presensi ditolak: Hari Libur Akhir Pekan ({hari}).", "reason": "WEEKEND"}), 403
-
-    # Cek hari libur CUSTOM (cuti bersama, dll) — prioritas pertama
-    libur_custom = HariLiburCustom.query.filter_by(tanggal=today_date).first()
-    if libur_custom:
-        print(f"\n🚫 [PREDICT] DITOLAK — Hari libur custom: {libur_custom.keterangan} | Device: {device_klien_sn}")
-        return jsonify({
-            "error": f"Presensi ditolak: {libur_custom.keterangan}.",
-            "reason": "CUSTOM_HOLIDAY", "holiday_name": libur_custom.keterangan
-        }), 403
-
-    # Cek hari libur nasional Indonesia (fallback)
-    id_holidays = holidays.Indonesia(years=today_date.year)
-    if today_date in id_holidays:
-        nama_libur = id_holidays.get(today_date)
-        print(f"\n🚫 [PREDICT] DITOLAK — Hari libur nasional: {nama_libur} | Device: {device_klien_sn}")
-        return jsonify({
-            "error": f"Presensi ditolak: Hari Libur Nasional — {nama_libur}.",
-            "reason": "HOLIDAY", "holiday_name": nama_libur
-        }), 403
-
     photo = request.files['photo']
     if not allowed_file(photo.filename):
         return jsonify({"error": "File type not allowed."}), 400
@@ -394,9 +524,13 @@ def predict():
     photo.save(image_path)
 
     test_embedding, test_embedding_flip = get_embeddings(image_path)
-    #os.remove(image_path)
 
     if test_embedding is None:
+        try:
+            if os.path.exists(image_path):
+                os.remove(image_path)
+        except Exception:
+            pass
         return jsonify({"error": "Failed to extract face embedding"}), 500
 
     best_nip, best_name, best_similarity = "unknown", "unknown", 0.0
@@ -422,9 +556,15 @@ def predict():
         if user:
             # ── Cek Approval Status ──
             if user.approval_status == 'pending':
+                try:
+                    if os.path.exists(image_path): os.remove(image_path)
+                except Exception: pass
                 print(f"\n🟡 [FACE-AI] PENDING: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Menunggu persetujuan Admin")
                 return jsonify({"error": "Akun Anda sedang menunggu persetujuan Admin."}), 403
             if user.approval_status == 'rejected':
+                try:
+                    if os.path.exists(image_path): os.remove(image_path)
+                except Exception: pass
                 print(f"\n🔴 [FACE-AI] REJECTED: {user.nama_lengkap} (NIP: {best_nip}) | Registrasi ditolak oleh Admin")
                 return jsonify({"error": "Registrasi Anda telah ditolak oleh Admin."}), 403
 
@@ -437,9 +577,7 @@ def predict():
             local_ts_raw = request.form.get('local_timestamp')
             if local_ts_raw:
                 try:
-                    # Parse ISO8601 dari Flutter (e.g. "2026-06-29T08:05:30.000+07:00")
                     parsed_ts = datetime.fromisoformat(local_ts_raw.replace('Z', '+00:00'))
-                    # Konversi ke WIB jika belum
                     wib = pytz.timezone('Asia/Jakarta')
                     if parsed_ts.tzinfo is None:
                         now = wib.localize(parsed_ts)
@@ -454,59 +592,94 @@ def predict():
                 now = get_wib_time()
 
             today = now.date()
-            status_absen = None
-
-            # ── Dynamic Working Hours from DB ──
-            def parse_time(val, fallback_h, fallback_m=0):
-                try:
-                    parts = val.strip().split(':')
-                    return time_type(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
-                except Exception:
-                    return time_type(fallback_h, fallback_m)
-
-            jam_masuk_mulai  = parse_time(AppSetting.get('JAM_MASUK_MULAI',  '06:00:00'), 6)
-            jam_masuk_akhir  = parse_time(AppSetting.get('JAM_MASUK_AKHIR',  '12:00:00'), 12)
-            batas_terlambat  = parse_time(AppSetting.get('BATAS_TERLAMBAT',  '08:00:00'), 8)
-            jam_keluar_mulai = parse_time(AppSetting.get('JAM_KELUAR_MULAI', '15:00:00'), 15)
-            jam_keluar_akhir = parse_time(AppSetting.get('JAM_KELUAR_AKHIR', '20:00:00'), 20)
-
+            yesterday = today - timedelta(days=1)
             ct = now.time()
-            if jam_masuk_mulai <= ct < jam_masuk_akhir:
-                status_absen = "IN"
-            elif jam_keluar_mulai <= ct < jam_keluar_akhir:
-                status_absen = "OUT"
-            else:
-                print(f"\n🟡 [FACE-AI] OUT OF HOURS: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Waktu: {now.strftime('%H:%M:%S')}")
-                print(f"   ↳ Dikenali tapi di luar jam presensi ({jam_masuk_mulai.strftime('%H:%M')}-{jam_masuk_akhir.strftime('%H:%M')} / {jam_keluar_mulai.strftime('%H:%M')}-{jam_keluar_akhir.strftime('%H:%M')})\n")
-                return jsonify({"message": f"Maaf {user.nama_lengkap}, sekarang bukan jam presensi ASN."}), 403
-                # # ── BYPASS SEMENTARA: Hilangkan batasan range waktu presensi untuk testing ──
-                # # Mengizinkan presensi kapan saja saat masa pengujian/demo.
-                # # Sebelum jam 13:00 dialokasikan 'IN', setelah jam 13:00 dialokasikan 'OUT'.
-                # status_absen = "IN" if ct < time_type(13, 0) else "OUT"
-                # print(f"\nℹ️ [FACE-AI] Bypass Range Waktu: {user.nama_lengkap} (NIP: {best_nip}) otomatis dialokasikan '{status_absen}' (Waktu: {now.strftime('%H:%M:%S')})")
-
-            # ── Attendance identifier: use AI-recognized NIP/NIK (best_nip) directly ──
-            # best_nip is ALWAYS populated here — it came from the face embedding match.
-            # This avoids NULL issues from user.pin (Non-ASN) or FK-nullified user.nip.
             attendance_id = best_nip
+            status_absen = None
+            tanggal_tugas = today
+            active_shift = None
 
-            # 2. Validasi: Cek apakah user sudah absen hari ini
+            # ── RULE 2: OVERNIGHT PARADOX (Cek Shift Lintas Hari Kemarin Terlebih Dahulu) ──
+            shift_yesterday = _resolve_active_shift(user, yesterday)
+            if shift_yesterday.get("is_lintas_hari") and (
+                shift_yesterday["mulai_scan_pulang"] <= ct <= shift_yesterday["akhir_scan_pulang"]
+            ):
+                # Cek apakah ada sesi shift malam kemarin atau memang jadwal lintas hari kemarin
+                in_yesterday = Presensi.query.filter(
+                    Presensi.user_pin == attendance_id,
+                    Presensi.tipe_absen == "IN",
+                    db.or_(
+                        Presensi.tanggal_tugas == yesterday,
+                        db.and_(Presensi.tanggal_tugas.is_(None), db.func.date(Presensi.waktu_scan) == yesterday)
+                    )
+                ).first()
+                if in_yesterday or shift_yesterday.get("source") == "ROSTER":
+                    status_absen = "OUT"
+                    tanggal_tugas = yesterday
+                    active_shift = shift_yesterday
+
+            # ── Evaluasi Shift Hari Ini jika bukan kepulangan shift malam kemarin ──
+            if status_absen is None:
+                active_shift = _resolve_active_shift(user, today)
+                tanggal_tugas = today
+
+                # ── RULE 5: RELOKASI VALIDASI HARI LIBUR SETELAH WAJAH & SHIFT DIKETAHUI ──
+                is_hol, hol_reason, hol_label = _check_date_holiday(today)
+                if is_hol and not active_shift.get("abaikan_libur", False):
+                    try:
+                        if os.path.exists(image_path): os.remove(image_path)
+                    except Exception: pass
+                    print(f"\n🚫 [PREDICT] DITOLAK — {hol_label} | Pegawai: {user.nama_lengkap} (Shift: {active_shift['nama_shift']}, abaikan_libur=False)")
+                    return jsonify({
+                        "error": f"Presensi ditolak: {hol_label}.",
+                        "reason": hol_reason,
+                        "holiday_name": hol_label
+                    }), 403
+
+                # Evaluasi Jendela Scan Masuk vs Pulang pada Shift Aktif
+                if active_shift["mulai_scan_masuk"] <= ct <= active_shift["akhir_scan_masuk"]:
+                    status_absen = "IN"
+                elif (not active_shift.get("is_lintas_hari")) and (
+                    active_shift["mulai_scan_pulang"] <= ct <= active_shift["akhir_scan_pulang"]
+                ):
+                    status_absen = "OUT"
+                else:
+                    try:
+                        if os.path.exists(image_path): os.remove(image_path)
+                    except Exception: pass
+                    print(f"\n🟡 [FACE-AI] OUT OF HOURS: {user.nama_lengkap} (NIP: {best_nip}) | Shift: {active_shift['nama_shift']} | Waktu: {now.strftime('%H:%M:%S')}")
+                    return jsonify({
+                        "message": (
+                            f"Maaf {user.nama_lengkap}, sekarang di luar jam presensi {active_shift['nama_shift']} "
+                            f"(Scan Masuk: {active_shift['mulai_scan_masuk_str']}-{active_shift['akhir_scan_masuk_str']}, "
+                            f"Scan Pulang: {active_shift['mulai_scan_pulang_str']}-{active_shift['akhir_scan_pulang_str']})."
+                        )
+                    }), 403
+
+            # 2. Validasi Duplikat berdasarkan (user_pin, tanggal_tugas, tipe_absen)
             existing_log = Presensi.query.filter(
                 Presensi.user_pin == attendance_id,
-                db.func.date(Presensi.waktu_scan) == today,
-                Presensi.tipe_absen == status_absen
+                Presensi.tipe_absen == status_absen,
+                db.or_(
+                    Presensi.tanggal_tugas == tanggal_tugas,
+                    db.and_(Presensi.tanggal_tugas.is_(None), db.func.date(Presensi.waktu_scan) == tanggal_tugas)
+                )
             ).first()
 
             if existing_log:
-                print(f"\n🟡 [FACE-AI] DUPLICATE: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Sudah {status_absen} hari ini\n")
-                return jsonify({"message": f"Anda sudah melakukan presensi {status_absen} hari ini."}), 400
+                try:
+                    if os.path.exists(image_path): os.remove(image_path)
+                except Exception: pass
+                print(f"\n🟡 [FACE-AI] DUPLICATE: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Sudah {status_absen} untuk tanggal tugas {tanggal_tugas}\n")
+                return jsonify({"message": f"Anda sudah melakukan presensi {status_absen} untuk jadwal tanggal {tanggal_tugas.strftime('%d-%m-%Y')}."}), 400
 
-            # 3. Hitung Keterlambatan (Dynamic — hanya sesi IN)
+            # 3. RULE 3: Hitung Keterlambatan Terpusat (Grace Period = jam_masuk + menit_toleransi)
             status_kehadiran = "ON_TIME"
             keterlambatan_menit = 0
 
             if status_absen == "IN":
-                batas_dt = now.replace(hour=batas_terlambat.hour, minute=batas_terlambat.minute, second=0, microsecond=0)
+                batas_t = active_shift["batas_masuk"]
+                batas_dt = now.replace(hour=batas_t.hour, minute=batas_t.minute, second=batas_t.second, microsecond=0)
                 if now > batas_dt:
                     status_kehadiran = "LATE"
                     delta = now - batas_dt
@@ -527,14 +700,16 @@ def predict():
                 tipe_absen=status_absen,
                 status_kehadiran=status_kehadiran,
                 keterlambatan_menit=keterlambatan_menit,
-                foto_presensi=foto_url
+                foto_presensi=foto_url,
+                tanggal_tugas=tanggal_tugas,
+                jam_kerja_id=active_shift.get("id")
             )
             db.session.add(new_log)
             db.session.commit()
 
             late_info = f" | Terlambat: {keterlambatan_menit} menit" if status_kehadiran == "LATE" else ""
             sync_tag = " [OFFLINE-SYNC]" if is_offline_sync else ""
-            print(f"\n🟢 [FACE-AI]{sync_tag} MATCH: {best_name} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Status: {status_absen} | {status_kehadiran}{late_info}")
+            print(f"\n🟢 [FACE-AI]{sync_tag} MATCH: {best_name} (NIP: {best_nip}) | Shift: {active_shift['nama_shift']} (Tugas: {tanggal_tugas}) | Similarity: {similarity_pct}% | Status: {status_absen} | {status_kehadiran}{late_info}")
             print(f"   ↳ Waktu: {now.strftime('%H:%M:%S')} | Device: {device_klien_sn} | AttendanceID: {attendance_id} | Foto: {foto_url or '-'}\n")
             
             return jsonify({
@@ -544,11 +719,18 @@ def predict():
                 "status_kehadiran": status_kehadiran,
                 "keterlambatan_menit": keterlambatan_menit,
                 "waktu": now.strftime("%H:%M:%S"),
+                "tanggal_tugas": tanggal_tugas.strftime("%Y-%m-%d"),
+                "nama_shift": active_shift["nama_shift"],
                 "foto_presensi": foto_url,
                 "is_offline_sync": is_offline_sync
             }), 200
 
     # ── STRICT REJECTION: Wajah tidak dikenali atau di bawah threshold ──
+    try:
+        if os.path.exists(image_path):
+            os.remove(image_path)
+    except Exception:
+        pass
     similarity_pct = float(round(best_similarity * 100, 1))
     print(f"\n🔴 [FACE-AI] UNKNOWN FACE! | Highest Similarity: {similarity_pct}% | Threshold: {round(THRESHOLD * 100, 1)}%")
     if best_name != "unknown":
@@ -698,11 +880,11 @@ def get_report(current_user):
     limit = request.args.get('limit', 20, type=int)
     search_query = request.args.get('search_name', '', type=str).strip()
     status_filter = request.args.get('status_filter', '', type=str).strip().upper()
-    kegiatan_id_filter = request.args.get('kegiatan_id', type=int)  # Optional: filter by kegiatan
+    kegiatan_id_filter = request.args.get('kegiatan_id', type=int)
     role_filter = request.args.get('role', '', type=str).lower()
-    opd_id_filter = request.args.get('opd_id', type=int)  # Optional OPD filter for super_admin
+    opd_id_filter = request.args.get('opd_id', type=int)
+    jam_kerja_id_filter = request.args.get('jam_kerja_id', type=int)
 
-    # Map employment category: 'asn' includes ASN employees elevated to admin_opd / super_admin
     if role_filter == 'asn':
         target_roles = ['asn', 'admin_opd', 'super_admin']
     elif role_filter == 'non_asn':
@@ -714,7 +896,9 @@ def get_report(current_user):
 
     effective_opd_id = current_user.opd_id if current_user.role == 'admin_opd' else opd_id_filter
 
-    today = get_wib_time().date()
+    now_wib = get_wib_time()
+    today = now_wib.date()
+    now_time = now_wib.time()
     try:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date() if start_date_str else today
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date() if end_date_str else today
@@ -726,31 +910,46 @@ def get_report(current_user):
     if (end_date - start_date).days > 93:
         return jsonify({"error": "Rentang tanggal maksimum 93 hari."}), 400
 
-    # ────────────────────────────────────────────────────────
-    # NOTE: kegiatan_id filter on DAILY report is no longer used
-    # (kegiatan presensi now uses separate /api/report/kegiatan)
-    # ────────────────────────────────────────────────────────
-    enrolled_nips = None  # Not used for daily report anymore
+    # Pre-load shifts & roster in date range for O(1) lookup
+    shifts_by_id = {s.id: s for s in MasterJamKerja.query.all()}
+    global_fallback_shift = _get_global_fallback_shift_dict()
+
+    roster_rows = RosterJadwalShift.query.filter(
+        RosterJadwalShift.tanggal >= start_date,
+        RosterJadwalShift.tanggal <= end_date
+    ).all()
+    roster_lookup = {(r.user_id, r.tanggal): r for r in roster_rows}
+
+    # RULE 4: Pre-load PresensiKegiatan (Dinas Luar Override) in date range
+    kegiatan_logs = db.session.query(PresensiKegiatan, JadwalKegiatan).join(
+        JadwalKegiatan, PresensiKegiatan.kegiatan_id == JadwalKegiatan.id
+    ).filter(
+        db.func.date(PresensiKegiatan.waktu_scan) >= start_date,
+        db.func.date(PresensiKegiatan.waktu_scan) <= end_date,
+    ).all()
+    dinas_luar_lookup = {}
+    for pk, kg in kegiatan_logs:
+        d_key = (pk.nip, pk.waktu_scan.date())
+        if d_key not in dinas_luar_lookup:
+            dinas_luar_lookup[d_key] = (pk, kg)
 
     # ────────────────────────────────────────────────────────
-    # STEP 1: Ambil SEMUA log presensi dalam rentang tanggal
-    #         Scope admin_opd berdasarkan DEVICE OPD (bukan user OPD)
+    # STEP 1: Ambil SEMUA log presensi berdasarkan tanggal_tugas (atau date(waktu_scan))
     # ────────────────────────────────────────────────────────
+    effective_log_date = db.func.coalesce(Presensi.tanggal_tugas, db.func.date(Presensi.waktu_scan))
     presensi_q = Presensi.query.filter(
-        db.func.date(Presensi.waktu_scan) >= start_date,
-        db.func.date(Presensi.waktu_scan) <= end_date,
+        effective_log_date >= start_date,
+        effective_log_date <= end_date,
     )
-    # Filter by kegiatan_id if provided
     if kegiatan_id_filter:
         presensi_q = presensi_q.filter(Presensi.kegiatan_id == kegiatan_id_filter)
-        
-    # Filter by role category (ASN / Non-ASN)
+
     if target_roles:
         presensi_q = presensi_q.join(
             User,
             db.or_(Presensi.user_pin == User.nip, Presensi.user_pin == User.pin)
         ).filter(User.role.in_(target_roles))
-        
+
     if current_user.role == 'admin_opd':
         opd_device_sns = [d.sn for d in Device.query.filter_by(opd_id=current_user.opd_id).all()]
         if opd_device_sns:
@@ -761,14 +960,14 @@ def get_report(current_user):
     all_logs = presensi_q.all()
 
     # ────────────────────────────────────────────────────────
-    # STEP 2: Resolve identity via data_pegawai (LEFT JOIN fallback)
-    #         data_pegawai is the source of truth for NIP & nama
+    # STEP 2: Resolve identity via data_pegawai & User
     # ────────────────────────────────────────────────────────
     unique_ids = set(log.user_pin for log in all_logs if log.user_pin)
     pin_identity = {}
+    user_by_uid = {}
     for uid in unique_ids:
-        # user_pin now stores NIP/NIK (from /predict's best_nip). Try nip first, then pin.
         user = User.query.filter_by(nip=uid).first() or User.query.filter_by(pin=uid).first()
+        user_by_uid[uid] = user
         user_role = user.role if user else 'asn'
         user_opd_id = user.opd_id if user else None
         user_opd_nama = (user.opd.nama_opd if user and user.opd else None)
@@ -802,17 +1001,19 @@ def get_report(current_user):
             }
 
     # ────────────────────────────────────────────────────────
-    # STEP 3: Index logs by (pin, date) and group IN/OUT
+    # STEP 3: Index logs by (pin, tanggal_tugas) and group IN/OUT (Rule 1 & Rule 2)
     # ────────────────────────────────────────────────────────
     logs_index = {}
     for log in all_logs:
-        key = (log.user_pin, log.waktu_scan.date())
+        log_duty_date = log.tanggal_tugas if log.tanggal_tugas else log.waktu_scan.date()
+        key = (log.user_pin, log_duty_date)
         logs_index.setdefault(key, []).append(log)
 
     existing_keys = set(logs_index.keys())
     report_data = []
     for (pin, log_date), logs in logs_index.items():
         identity = pin_identity.get(pin, {"nip": pin, "nama": f"Unknown ({pin})"})
+        user_obj = user_by_uid.get(pin)
         if identity.get("nip"):
             existing_keys.add((identity["nip"], log_date))
         if identity.get("pin"):
@@ -823,6 +1024,36 @@ def get_report(current_user):
 
         earliest_in = min(in_logs, key=lambda l: l.waktu_scan) if in_logs else None
         latest_out = max(out_logs, key=lambda l: l.waktu_scan) if out_logs else None
+
+        # Resolve shift used for this attendance record
+        recorded_shift_id = (
+            (earliest_in.jam_kerja_id if earliest_in and earliest_in.jam_kerja_id else None)
+            or (latest_out.jam_kerja_id if latest_out and latest_out.jam_kerja_id else None)
+        )
+        if recorded_shift_id and recorded_shift_id in shifts_by_id:
+            active_shift = _shift_model_to_dict(shifts_by_id[recorded_shift_id], source="RECORDED")
+        else:
+            active_shift = _resolve_active_shift(
+                user_obj, log_date, roster_lookup=roster_lookup,
+                shifts_by_id=shifts_by_id, global_fallback=global_fallback_shift
+            )
+
+        # RULE 1: Cut-Off Lupa Absen Pulang (MISSING_OUT vs WORKING)
+        if latest_out:
+            status_keluar = "CHECKED_OUT"
+        else:
+            if log_date < today:
+                if active_shift["is_lintas_hari"] and log_date == (today - timedelta(days=1)) and now_time <= active_shift["akhir_scan_pulang"]:
+                    status_keluar = "WORKING"
+                else:
+                    status_keluar = "MISSING_OUT"
+            elif log_date == today:
+                if not active_shift["is_lintas_hari"] and now_time > active_shift["akhir_scan_pulang"]:
+                    status_keluar = "MISSING_OUT"
+                else:
+                    status_keluar = "WORKING"
+            else:
+                status_keluar = "MISSING"
 
         active_sn = earliest_in.device_sn if earliest_in else (latest_out.device_sn if latest_out else None)
         lokasi = None
@@ -842,15 +1073,23 @@ def get_report(current_user):
             "nama_opd": identity.get("nama_opd"),
             "tanggal": log_date.strftime("%Y-%m-%d"),
             "jam_masuk": earliest_in.waktu_scan.strftime("%H:%M:%S") if earliest_in else None,
-            "status_masuk": earliest_in.status_kehadiran if earliest_in else None,
+            "status_masuk": earliest_in.status_kehadiran if earliest_in else "ON_TIME",
             "keterlambatan_menit": (earliest_in.keterlambatan_menit or 0) if earliest_in else 0,
             "jam_keluar": latest_out.waktu_scan.strftime("%H:%M:%S") if latest_out else None,
-            "status_keluar": "CHECKED_OUT" if latest_out else "MISSING",
+            "status_keluar": status_keluar,
             "device_sn": active_sn,
             "nama_lokasi": lokasi,
             "foto_presensi": primary_foto_url,
             "foto_masuk": foto_masuk_url,
             "foto_keluar": foto_keluar_url,
+            "jam_kerja_id": active_shift["id"],
+            "nama_shift": active_shift["nama_shift"],
+            "jam_baku": active_shift["jam_baku"],
+            "is_lintas_hari": active_shift["is_lintas_hari"],
+            "abaikan_libur": active_shift["abaikan_libur"],
+            "sumber_jadwal": active_shift["source"],
+            "is_dinas_luar": False,
+            "nama_kegiatan": None,
         })
 
     # SECURITY FIX: Enforce tenant isolation / OPD filter on presensi-derived rows
@@ -861,14 +1100,8 @@ def get_report(current_user):
         )
         report_data = [r for r in report_data if str(r['nip']) in opd_nips]
 
-    # Then further restrict to enrolled NIPs if kegiatan_id is set
-    if enrolled_nips is not None:
-        enrolled_set = set(enrolled_nips)
-        report_data = [r for r in report_data if str(r['nip']) in enrolled_set]
-
     # ────────────────────────────────────────────────────────
-    # STEP 4: Generate virtual ABSENT rows for ALL real employees
-    #         (Admin OPD ASN + ASN + Non-ASN according to filter)
+    # STEP 4: Generate virtual rows (Dinas Luar Override or ABSENT) for ALL real employees
     # ────────────────────────────────────────────────────────
     known_users_q = User.query
     if effective_opd_id:
@@ -877,32 +1110,20 @@ def get_report(current_user):
         known_users_q = known_users_q.filter(User.role.in_(target_roles))
     known_users = [u for u in known_users_q.all() if _is_employee_account(u)]
 
-    # SECURITY FIX: When kegiatan_id is set, intersect enrolled NIPs with OPD scope
-    if enrolled_nips is not None:
-        known_users = [u for u in known_users if (u.nip or '') in enrolled_nips]
-
     id_holidays_cache = {}
-
-    # Pre-load custom holidays for the date range
     custom_holidays_in_range = HariLiburCustom.query.filter(
         HariLiburCustom.tanggal >= start_date,
         HariLiburCustom.tanggal <= end_date
     ).all()
-    custom_holiday_dates = set(h.tanggal for h in custom_holidays_in_range)
+    custom_holiday_map = {h.tanggal: h.keterangan for h in custom_holidays_in_range}
 
     current_date = start_date
     while current_date <= end_date:
-        yr = current_date.year
-        if yr not in id_holidays_cache:
-            id_holidays_cache[yr] = holidays.Indonesia(years=yr)
-
-        is_holiday = (
-            current_date.weekday() >= 5
-            or current_date in id_holidays_cache[yr]
-            or current_date in custom_holiday_dates
+        is_holiday, _, _ = _check_date_holiday(
+            current_date, id_holidays_cache=id_holidays_cache, custom_holiday_map=custom_holiday_map
         )
 
-        if not is_holiday and current_date <= today:
+        if current_date <= today:
             for u in known_users:
                 attendance_id = u.nip if u.nip else u.pin
                 if not attendance_id:
@@ -912,7 +1133,51 @@ def get_report(current_user):
                     or (u.nip and (u.nip, current_date) in existing_keys)
                     or (u.pin and (u.pin, current_date) in existing_keys)
                 )
-                if not already_logged:
+                if already_logged:
+                    continue
+
+                active_shift = _resolve_active_shift(
+                    u, current_date, roster_lookup=roster_lookup,
+                    shifts_by_id=shifts_by_id, global_fallback=global_fallback_shift
+                )
+
+                # RULE 4: Hierarki Dinas Luar (Jadwal Kegiatan Override)
+                dl_match = dinas_luar_lookup.get((u.nip, current_date))
+                if dl_match:
+                    pk, kg = dl_match
+                    report_data.append({
+                        "nip": u.nip or attendance_id,
+                        "nama": u.nama_lengkap,
+                        "role": u.role,
+                        "opd_id": u.opd_id,
+                        "nama_opd": u.opd.nama_opd if u.opd else None,
+                        "tanggal": current_date.strftime("%Y-%m-%d"),
+                        "jam_masuk": pk.waktu_scan.strftime("%H:%M:%S"),
+                        "status_masuk": "ON_TIME",
+                        "keterlambatan_menit": 0,
+                        "jam_keluar": None,
+                        "status_keluar": "DINAS_LUAR",
+                        "device_sn": pk.device_sn,
+                        "nama_lokasi": f"Dinas Luar: {kg.nama_kegiatan}",
+                        "foto_presensi": None,
+                        "foto_masuk": None,
+                        "foto_keluar": None,
+                        "jam_kerja_id": active_shift["id"],
+                        "nama_shift": active_shift["nama_shift"],
+                        "jam_baku": active_shift["jam_baku"],
+                        "is_lintas_hari": active_shift["is_lintas_hari"],
+                        "abaikan_libur": active_shift["abaikan_libur"],
+                        "sumber_jadwal": "KEGIATAN",
+                        "is_dinas_luar": True,
+                        "nama_kegiatan": kg.nama_kegiatan,
+                    })
+                    continue
+
+                # RULE 5: Pada hari libur/akhir pekan, hanya pegawai yang ter-plot di Roster dengan shift `abaikan_libur=True` yang diwajibkan hadir
+                should_work_today = (not is_holiday) or (
+                    active_shift["abaikan_libur"] and active_shift["source"] == "ROSTER"
+                )
+                if should_work_today:
                     identity = pin_identity.get(attendance_id)
                     if not identity:
                         identity = {"nip": u.nip or attendance_id, "nama": u.nama_lengkap}
@@ -933,15 +1198,31 @@ def get_report(current_user):
                         "foto_presensi": None,
                         "foto_masuk": None,
                         "foto_keluar": None,
+                        "jam_kerja_id": active_shift["id"],
+                        "nama_shift": active_shift["nama_shift"],
+                        "jam_baku": active_shift["jam_baku"],
+                        "is_lintas_hari": active_shift["is_lintas_hari"],
+                        "abaikan_libur": active_shift["abaikan_libur"],
+                        "sumber_jadwal": active_shift["source"],
+                        "is_dinas_luar": False,
+                        "nama_kegiatan": None,
                     })
         current_date += timedelta(days=1)
 
     # ────────────────────────────────────────────────────────
-    # STEP 5: Search filter (by nama or NIP)
+    # STEP 5: Search & Shift filter
     # ────────────────────────────────────────────────────────
     if search_query:
         sq = search_query.lower()
-        report_data = [r for r in report_data if sq in r['nama'].lower() or sq in str(r['nip']).lower()]
+        report_data = [
+            r for r in report_data
+            if sq in r['nama'].lower()
+            or sq in str(r['nip']).lower()
+            or sq in (r.get('nama_shift') or '').lower()
+        ]
+
+    if jam_kerja_id_filter:
+        report_data = [r for r in report_data if r.get("jam_kerja_id") == jam_kerja_id_filter]
 
     # ────────────────────────────────────────────────────────
     # STEP 5.5: Global Summary Counts (across ALL matching records, BEFORE pagination & status_filter)
@@ -951,17 +1232,21 @@ def get_report(current_user):
         "on_time": sum(1 for r in report_data if r.get("status_masuk") == "ON_TIME"),
         "late": sum(1 for r in report_data if r.get("status_masuk") == "LATE"),
         "absent": sum(1 for r in report_data if r.get("status_masuk") == "ABSENT"),
-        "checked_out": sum(1 for r in report_data if bool(r.get("jam_keluar"))),
+        "checked_out": sum(1 for r in report_data if bool(r.get("jam_keluar")) or r.get("is_dinas_luar")),
+        "missing_out": sum(1 for r in report_data if r.get("status_keluar") == "MISSING_OUT"),
     }
 
     # ────────────────────────────────────────────────────────
     # STEP 6: Status filter
     # ────────────────────────────────────────────────────────
     if status_filter:
-        valid_statuses = ['ON_TIME', 'LATE', 'ABSENT']
+        valid_statuses = ['ON_TIME', 'LATE', 'ABSENT', 'MISSING_OUT']
         if status_filter not in valid_statuses:
             return jsonify({"error": f"status_filter tidak valid. Gunakan: {', '.join(valid_statuses)}"}), 400
-        report_data = [r for r in report_data if r['status_masuk'] == status_filter]
+        if status_filter == 'MISSING_OUT':
+            report_data = [r for r in report_data if r.get('status_keluar') == 'MISSING_OUT']
+        else:
+            report_data = [r for r in report_data if r['status_masuk'] == status_filter]
 
     # ────────────────────────────────────────────────────────
     # STEP 7: Sorting (tanggal desc, nama asc)
@@ -991,19 +1276,16 @@ def get_report(current_user):
         }
     }), 200
 
+
 @api_blueprint.route('/manage-asn', methods=['GET'])
 @token_required
 def get_manage_asn(current_user):
     today = get_wib_time().date()
     role_filter = request.args.get('role', '', type=str).lower()
 
-    # ── Fetch ALL real employee users (ASN + Admin OPD + Non-ASN) ──
-    # Admins are employees too — they need attendance monitoring.
-    # Security is enforced via the `is_manageable` flag, not by hiding data.
     if current_user.role == 'super_admin':
         users = [u for u in User.query.all() if _is_employee_account(u)]
     else:
-        # admin_opd: Users in my OPD + users with cross-OPD access to my OPD
         primary_users = User.query.filter_by(opd_id=current_user.opd_id).all()
 
         cross_nips = [a.user_nip for a in UserAksesOpd.query.filter_by(
@@ -1027,15 +1309,19 @@ def get_manage_asn(current_user):
     elif role_filter:
         users = [u for u in users if u.role == role_filter]
 
+    shifts_by_id = {s.id: s for s in MasterJamKerja.query.all()}
+    global_fallback_shift = _get_global_fallback_shift_dict()
+
     data_asn = []
     for user in users:
-        # ── Attendance identifier: NIP is always set by registration (ASN=18digit, Non-ASN=16digit NIK) ──
         attendance_id = user.nip if user.nip else user.pin
 
-        # ── Status Kehadiran Hari Ini ──
         logs_today = Presensi.query.filter(
             Presensi.user_pin == attendance_id,
-            db.func.date(Presensi.waktu_scan) == today
+            db.or_(
+                Presensi.tanggal_tugas == today,
+                db.and_(Presensi.tanggal_tugas.is_(None), db.func.date(Presensi.waktu_scan) == today)
+            )
         ).all()
 
         status_hari_ini = "Belum Hadir"
@@ -1047,7 +1333,6 @@ def get_manage_asn(current_user):
             elif has_in:
                 status_hari_ini = "Hadir"
 
-        # ── Cross-OPD Privileges ──
         cross_opd_list = []
         if user.nip:
             akses_records = UserAksesOpd.query.filter_by(user_nip=user.nip).all()
@@ -1060,13 +1345,16 @@ def get_manage_asn(current_user):
                     "approval_status": akses.approval_status or "approved",
                 })
 
-        # ── Permission Flag: can the logged-in user manage this row? ──
-        # super_admin can manage everyone.
-        # admin_opd can only manage ASN accounts, not other admins.
         if current_user.role == 'super_admin':
             is_manageable = True
         else:
-            is_manageable = (user.role == 'asn')
+            is_manageable = (user.role in ('asn', 'non_asn') or user.id == current_user.id)
+
+        default_shift = (
+            _shift_model_to_dict(shifts_by_id[user.jam_kerja_id], source="DEFAULT_USER")
+            if (user.jam_kerja_id and user.jam_kerja_id in shifts_by_id)
+            else global_fallback_shift
+        )
 
         data_asn.append({
             "id": user.id,
@@ -1079,6 +1367,11 @@ def get_manage_asn(current_user):
             "is_face_registered": user.is_face_registered,
             "is_manageable": is_manageable,
             "cross_opd_privileges": cross_opd_list,
+            "jam_kerja_id": user.jam_kerja_id,
+            "nama_shift": default_shift["nama_shift"],
+            "jam_baku": default_shift["jam_baku"],
+            "is_lintas_hari": default_shift["is_lintas_hari"],
+            "abaikan_libur": default_shift["abaikan_libur"],
         })
 
     return jsonify(data_asn), 200
@@ -2539,7 +2832,7 @@ def get_kegiatan(current_user):
             "jumlah_hadir": hadir_count,
             "created_at": k.created_at.strftime('%Y-%m-%d %H:%M:%S') if k.created_at else None,
         })
-    return jsonify(result), 200
+    return jsonify({"data": result}), 200
 
 
 @api_blueprint.route('/kegiatan/<int:id>', methods=['DELETE'])
@@ -2585,7 +2878,7 @@ def get_active_kegiatan():
             "alamat_lokasi": k.alamat_lokasi, "is_global": k.is_global,
             "jam_mulai": k.jam_mulai.strftime('%H:%M') if k.jam_mulai else None,
             "jam_selesai": k.jam_selesai.strftime('%H:%M') if k.jam_selesai else None})
-    return jsonify(result), 200
+    return jsonify({"data": result}), 200
 
 
 @api_blueprint.route('/predict/kegiatan', methods=['POST'])
@@ -2717,3 +3010,491 @@ def report_kegiatan(current_user):
         "per_page": per_page, "total_pages": math.ceil(total / per_page) if per_page > 0 else 1}), 200
 
 
+# ==========================================
+# 12. MODUL MANAJEMEN JAM KERJA & SISTEM ROSTER SHIFT (PLAN_JAM_KERJA.md)
+# ==========================================
+
+@api_blueprint.route('/jam-kerja', methods=['GET'])
+@token_required
+def get_jam_kerja_list(current_user):
+    """
+    Mengambil daftar profil Master Jam Kerja.
+    - Super Admin: dapat melihat seluruh shift (atau filter ?opd_id=).
+    - Admin OPD: melihat shift Global (opd_id IS NULL) + shift khusus OPD miliknya.
+    """
+    opd_id_param = request.args.get('opd_id', type=int)
+    query = MasterJamKerja.query
+
+    if current_user.role == 'admin_opd':
+        query = query.filter(
+            db.or_(MasterJamKerja.opd_id.is_(None), MasterJamKerja.opd_id == current_user.opd_id)
+        )
+    elif opd_id_param is not None:
+        query = query.filter(
+            db.or_(MasterJamKerja.opd_id.is_(None), MasterJamKerja.opd_id == opd_id_param)
+        )
+
+    shifts = query.order_by(MasterJamKerja.opd_id.nullsfirst(), MasterJamKerja.id.asc()).all()
+
+    result = []
+    for s in shifts:
+        d = _serialize_shift_json(s)
+        d["jumlah_pegawai_default"] = User.query.filter_by(jam_kerja_id=s.id).count()
+        d["jumlah_roster_aktif"] = RosterJadwalShift.query.filter_by(jam_kerja_id=s.id).count()
+        result.append(d)
+
+    return jsonify({"data": result}), 200
+
+
+@api_blueprint.route('/jam-kerja', methods=['POST'])
+@token_required
+def create_jam_kerja(current_user):
+    """Membuat profil Master Jam Kerja baru."""
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    data = request.get_json() or {}
+    nama_shift = (data.get('nama_shift') or '').strip()
+    if not nama_shift:
+        return jsonify({"error": "Nama shift wajib diisi."}), 400
+
+    required_times = [
+        'jam_masuk', 'jam_pulang',
+        'mulai_scan_masuk', 'akhir_scan_masuk',
+        'mulai_scan_pulang', 'akhir_scan_pulang'
+    ]
+    parsed_times = {}
+    for field in required_times:
+        val = data.get(field)
+        if not val:
+            return jsonify({"error": f"Field '{field}' wajib diisi (HH:MM)."}), 400
+        parsed_times[field] = _parse_time_val(val)
+
+    # Admin OPD hanya boleh membuat shift khusus instansinya sendiri
+    if current_user.role == 'admin_opd':
+        target_opd_id = current_user.opd_id
+    else:
+        raw_opd = data.get('opd_id')
+        target_opd_id = int(raw_opd) if raw_opd not in (None, '', 'null', 0, '0') else None
+
+    new_shift = MasterJamKerja(
+        nama_shift=nama_shift,
+        jam_masuk=parsed_times['jam_masuk'],
+        jam_pulang=parsed_times['jam_pulang'],
+        mulai_scan_masuk=parsed_times['mulai_scan_masuk'],
+        akhir_scan_masuk=parsed_times['akhir_scan_masuk'],
+        mulai_scan_pulang=parsed_times['mulai_scan_pulang'],
+        akhir_scan_pulang=parsed_times['akhir_scan_pulang'],
+        menit_toleransi=int(data.get('menit_toleransi') or 0),
+        is_lintas_hari=bool(data.get('is_lintas_hari', False)),
+        abaikan_libur=bool(data.get('abaikan_libur', False)),
+        opd_id=target_opd_id,
+    )
+    db.session.add(new_shift)
+    db.session.commit()
+
+    catat_audit(
+        current_user.id, 'CREATE_JAM_KERJA', 'master_jam_kerja',
+        f"Membuat profil jam kerja '{nama_shift}' ({'Global' if target_opd_id is None else f'OPD #{target_opd_id}'})",
+        target_record_id=str(new_shift.id)
+    )
+    return jsonify({
+        "message": f"Profil jam kerja '{nama_shift}' berhasil dibuat.",
+        "data": _serialize_shift_json(new_shift)
+    }), 201
+
+
+@api_blueprint.route('/jam-kerja/<int:shift_id>', methods=['PUT'])
+@token_required
+def update_jam_kerja(current_user, shift_id):
+    """Memperbarui profil Master Jam Kerja."""
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    shift = MasterJamKerja.query.get(shift_id)
+    if not shift:
+        return jsonify({"error": "Profil jam kerja tidak ditemukan."}), 404
+
+    if current_user.role == 'admin_opd' and shift.opd_id != current_user.opd_id:
+        return jsonify({"error": "Admin OPD hanya dapat mengubah profil jam kerja khusus instansinya sendiri."}), 403
+
+    data = request.get_json() or {}
+    if 'nama_shift' in data and str(data['nama_shift']).strip():
+        shift.nama_shift = str(data['nama_shift']).strip()
+
+    for field in ['jam_masuk', 'jam_pulang', 'mulai_scan_masuk', 'akhir_scan_masuk', 'mulai_scan_pulang', 'akhir_scan_pulang']:
+        if field in data and data[field]:
+            setattr(shift, field, _parse_time_val(data[field]))
+
+    if 'menit_toleransi' in data:
+        shift.menit_toleransi = max(0, int(data.get('menit_toleransi') or 0))
+    if 'is_lintas_hari' in data:
+        shift.is_lintas_hari = bool(data['is_lintas_hari'])
+    if 'abaikan_libur' in data:
+        shift.abaikan_libur = bool(data['abaikan_libur'])
+
+    if current_user.role == 'super_admin' and 'opd_id' in data:
+        raw_opd = data.get('opd_id')
+        shift.opd_id = int(raw_opd) if raw_opd not in (None, '', 'null', 0, '0') else None
+
+    db.session.commit()
+    catat_audit(
+        current_user.id, 'UPDATE_JAM_KERJA', 'master_jam_kerja',
+        f"Memperbarui profil jam kerja '{shift.nama_shift}'",
+        target_record_id=str(shift.id)
+    )
+    return jsonify({
+        "message": f"Profil jam kerja '{shift.nama_shift}' berhasil diperbarui.",
+        "data": _serialize_shift_json(shift)
+    }), 200
+
+
+@api_blueprint.route('/jam-kerja/<int:shift_id>', methods=['DELETE'])
+@token_required
+def delete_jam_kerja(current_user, shift_id):
+    """Menghapus profil Master Jam Kerja (dilindungi jika masih digunakan di roster)."""
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    shift = MasterJamKerja.query.get(shift_id)
+    if not shift:
+        return jsonify({"error": "Profil jam kerja tidak ditemukan."}), 404
+
+    if current_user.role == 'admin_opd' and shift.opd_id != current_user.opd_id:
+        return jsonify({"error": "Admin OPD tidak dapat menghapus profil jam kerja Global atau milik OPD lain."}), 403
+
+    roster_count = RosterJadwalShift.query.filter_by(jam_kerja_id=shift.id).count()
+    if roster_count > 0:
+        return jsonify({
+            "error": f"Profil '{shift.nama_shift}' sedang dipakai pada {roster_count} jadwal roster aktif. Hapus/ubah jadwal roster terlebih dahulu."
+        }), 409
+
+    # Lepas penugasan default pada users sebelum hapus
+    User.query.filter_by(jam_kerja_id=shift.id).update({"jam_kerja_id": None})
+    nama = shift.nama_shift
+    db.session.delete(shift)
+    db.session.commit()
+
+    catat_audit(
+        current_user.id, 'DELETE_JAM_KERJA', 'master_jam_kerja',
+        f"Menghapus profil jam kerja '{nama}'",
+        target_record_id=str(shift_id)
+    )
+    return jsonify({"message": f"Profil jam kerja '{nama}' berhasil dihapus."}), 200
+
+
+@api_blueprint.route('/users/<int:user_id>/jam-kerja', methods=['PUT'])
+@token_required
+def assign_user_jam_kerja(current_user, user_id):
+    """Menetapkan jam kerja default seorang pegawai (ASN / Non-ASN)."""
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    target_user = User.query.get(user_id)
+    if not target_user:
+        return jsonify({"error": "Pegawai tidak ditemukan."}), 404
+
+    if current_user.role == 'admin_opd' and target_user.opd_id != current_user.opd_id:
+        return jsonify({"error": "Pegawai ini bukan dari instansi OPD Anda."}), 403
+
+    data = request.get_json() or {}
+    raw_shift_id = data.get('jam_kerja_id')
+    if raw_shift_id in (None, '', 'null', 0, '0'):
+        target_user.jam_kerja_id = None
+        shift_name = "Default Global"
+    else:
+        shift = MasterJamKerja.query.get(int(raw_shift_id))
+        if not shift:
+            return jsonify({"error": "Profil jam kerja tidak ditemukan."}), 404
+        if shift.opd_id is not None and shift.opd_id != target_user.opd_id:
+            return jsonify({"error": "Profil jam kerja tersebut khusus untuk OPD lain."}), 400
+        target_user.jam_kerja_id = shift.id
+        shift_name = shift.nama_shift
+
+    db.session.commit()
+    catat_audit(
+        current_user.id, 'ASSIGN_JAM_KERJA', 'users',
+        f"Menetapkan jam kerja '{shift_name}' untuk {target_user.nama_lengkap} ({target_user.nip})",
+        target_record_id=str(target_user.id)
+    )
+    return jsonify({
+        "message": f"Jam kerja {target_user.nama_lengkap} berhasil diatur ke '{shift_name}'.",
+        "user_id": target_user.id,
+        "jam_kerja_id": target_user.jam_kerja_id,
+        "nama_shift": shift_name
+    }), 200
+
+
+@api_blueprint.route('/users/bulk-jam-kerja', methods=['POST'])
+@token_required
+def bulk_assign_user_jam_kerja(current_user):
+    """Menetapkan jam kerja default secara massal berdasarkan daftar user_ids atau nips."""
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    data = request.get_json() or {}
+    user_ids = data.get('user_ids') or []
+    nips = data.get('nips') or []
+    raw_shift_id = data.get('jam_kerja_id')
+
+    if not user_ids and not nips:
+        return jsonify({"error": "Pilih minimal satu pegawai (user_ids atau nips)."}), 400
+
+    shift = None
+    shift_name = "Default Global"
+    if raw_shift_id not in (None, '', 'null', 0, '0'):
+        shift = MasterJamKerja.query.get(int(raw_shift_id))
+        if not shift:
+            return jsonify({"error": "Profil jam kerja tidak ditemukan."}), 404
+        shift_name = shift.nama_shift
+
+    q = User.query
+    if user_ids:
+        q = q.filter(User.id.in_([int(uid) for uid in user_ids]))
+    else:
+        q = q.filter(User.nip.in_([str(n) for n in nips]))
+
+    if current_user.role == 'admin_opd':
+        q = q.filter_by(opd_id=current_user.opd_id)
+
+    matched_users = q.all()
+    for u in matched_users:
+        u.jam_kerja_id = shift.id if shift else None
+
+    db.session.commit()
+    catat_audit(
+        current_user.id, 'BULK_ASSIGN_JAM_KERJA', 'users',
+        f"Menetapkan jam kerja '{shift_name}' secara massal untuk {len(matched_users)} pegawai",
+        target_record_id=str(shift.id if shift else 0)
+    )
+    return jsonify({
+        "message": f"Berhasil menetapkan jam kerja '{shift_name}' untuk {len(matched_users)} pegawai.",
+        "updated_count": len(matched_users),
+        "jam_kerja_id": shift.id if shift else None,
+        "nama_shift": shift_name
+    }), 200
+
+
+@api_blueprint.route('/roster', methods=['GET'])
+@token_required
+def get_roster_matrix(current_user):
+    """
+    Mengambil matriks jadwal shift bulanan pegawai:
+    Query params: ?opd_id=X&bulan=MM&tahun=YYYY&role=asn|non_asn
+    """
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    now_wib = get_wib_time()
+    bulan = request.args.get('bulan', now_wib.month, type=int)
+    tahun = request.args.get('tahun', now_wib.year, type=int)
+    role_filter = request.args.get('role', '', type=str).lower()
+    opd_id_param = request.args.get('opd_id', type=int)
+
+    effective_opd_id = current_user.opd_id if current_user.role == 'admin_opd' else opd_id_param
+
+    import calendar
+    _, last_day = calendar.monthrange(tahun, bulan)
+    start_dt = date_type(tahun, bulan, 1)
+    end_dt = date_type(tahun, bulan, last_day)
+
+    user_q = User.query
+    if effective_opd_id:
+        user_q = user_q.filter_by(opd_id=effective_opd_id)
+    if role_filter == 'asn':
+        user_q = user_q.filter(User.role.in_(['asn', 'admin_opd', 'super_admin']))
+    elif role_filter == 'non_asn':
+        user_q = user_q.filter(User.role == 'non_asn')
+
+    employees = [u for u in user_q.order_by(User.nama_lengkap.asc()).all() if _is_employee_account(u)]
+    emp_ids = [u.id for u in employees]
+
+    roster_rows = RosterJadwalShift.query.filter(
+        RosterJadwalShift.user_id.in_(emp_ids) if emp_ids else False,
+        RosterJadwalShift.tanggal >= start_dt,
+        RosterJadwalShift.tanggal <= end_dt
+    ).all() if emp_ids else []
+
+    shifts_by_id = {s.id: s for s in MasterJamKerja.query.all()}
+    global_fallback = _get_global_fallback_shift_dict()
+
+    roster_map = {}
+    for r in roster_rows:
+        uid_str = str(r.user_id)
+        d_str = r.tanggal.strftime("%Y-%m-%d")
+        s_obj = shifts_by_id.get(r.jam_kerja_id)
+        roster_map.setdefault(uid_str, {})[d_str] = {
+            "id": r.id,
+            "jam_kerja_id": r.jam_kerja_id,
+            "nama_shift": s_obj.nama_shift if s_obj else "-",
+            "jam_baku": f"{s_obj.jam_masuk.strftime('%H:%M')}-{s_obj.jam_pulang.strftime('%H:%M')}" if s_obj else "-",
+            "is_lintas_hari": bool(s_obj.is_lintas_hari) if s_obj else False,
+            "abaikan_libur": bool(s_obj.abaikan_libur) if s_obj else False,
+            "keterangan": r.keterangan or "",
+        }
+
+    emp_list = []
+    for u in employees:
+        def_s = shifts_by_id.get(u.jam_kerja_id) if u.jam_kerja_id else None
+        emp_list.append({
+            "user_id": u.id,
+            "nip": u.nip,
+            "nama": u.nama_lengkap,
+            "role": u.role,
+            "opd_id": u.opd_id,
+            "nama_opd": u.opd.nama_opd if u.opd else "-",
+            "default_jam_kerja_id": u.jam_kerja_id,
+            "default_nama_shift": def_s.nama_shift if def_s else global_fallback["nama_shift"],
+            "default_jam_baku": f"{def_s.jam_masuk.strftime('%H:%M')}-{def_s.jam_pulang.strftime('%H:%M')}" if def_s else global_fallback["jam_baku"],
+        })
+
+    return jsonify({
+        "bulan": bulan,
+        "tahun": tahun,
+        "days_in_month": last_day,
+        "employees": emp_list,
+        "pegawai": emp_list,
+        "shifts": [_serialize_shift_json(s) for s in shifts_by_id.values()],
+        "roster": roster_map,
+    }), 200
+
+
+@api_blueprint.route('/roster/batch', methods=['POST'])
+@token_required
+def save_roster_batch(current_user):
+    """
+    Menyimpan / menghapus plotting roster untuk banyak sel sekaligus.
+    Body: { "entries": [ { "user_id": 12, "tanggal": "2026-10-28", "jam_kerja_id": 2, "keterangan": "Piket Pagi" }, ... ] }
+    Jika jam_kerja_id == null / 0, maka entry roster pada tanggal tersebut dihapus (kembali ke default shift).
+    """
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    data = request.get_json() or {}
+    entries = data.get('entries') or []
+    if not entries:
+        return jsonify({"error": "Daftar entries roster tidak boleh kosong."}), 400
+
+    upserted = 0
+    deleted = 0
+    for item in entries:
+        uid = item.get('user_id')
+        tgl_str = item.get('tanggal')
+        raw_shift_id = item.get('jam_kerja_id')
+        ket = (item.get('keterangan') or '').strip() or None
+
+        if not uid or not tgl_str:
+            continue
+
+        target_user = User.query.get(int(uid))
+        if not target_user:
+            continue
+        if current_user.role == 'admin_opd' and target_user.opd_id != current_user.opd_id:
+            continue
+
+        try:
+            tgl = datetime.strptime(tgl_str, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+
+        existing = RosterJadwalShift.query.filter_by(user_id=target_user.id, tanggal=tgl).first()
+        if raw_shift_id in (None, '', 'null', 0, '0'):
+            if existing:
+                db.session.delete(existing)
+                deleted += 1
+        else:
+            shift = MasterJamKerja.query.get(int(raw_shift_id))
+            if not shift:
+                continue
+            if existing:
+                existing.jam_kerja_id = shift.id
+                existing.keterangan = ket
+            else:
+                db.session.add(RosterJadwalShift(
+                    user_id=target_user.id,
+                    tanggal=tgl,
+                    jam_kerja_id=shift.id,
+                    keterangan=ket
+                ))
+            upserted += 1
+
+    db.session.commit()
+    catat_audit(
+        current_user.id, 'SAVE_ROSTER_BATCH', 'roster_jadwal_shift',
+        f"Menyimpan {upserted} jadwal roster & mereset {deleted} jadwal ke default",
+        target_record_id=str(upserted + deleted)
+    )
+    return jsonify({
+        "message": f"Roster berhasil diperbarui ({upserted} disimpan, {deleted} dikembalikan ke default).",
+        "upserted": upserted,
+        "deleted": deleted
+    }), 200
+
+
+@api_blueprint.route('/roster/swap', methods=['PUT'])
+@token_required
+def swap_roster_shift(current_user):
+    """
+    Menangani pertukaran jadwal jaga (Tukar Jaga) antara 2 pegawai pada tanggal tertentu.
+    Body: { "user_a_id": 10, "user_b_id": 11, "tanggal": "2026-10-28", "keterangan": "Tukar Jaga" }
+    """
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    data = request.get_json() or {}
+    user_a_id = data.get('user_a_id')
+    user_b_id = data.get('user_b_id')
+    tgl_str = data.get('tanggal')
+    catatan = (data.get('keterangan') or '').strip()
+
+    if not user_a_id or not user_b_id or not tgl_str:
+        return jsonify({"error": "user_a_id, user_b_id, dan tanggal wajib diisi."}), 400
+    if int(user_a_id) == int(user_b_id):
+        return jsonify({"error": "Pilih dua pegawai yang berbeda untuk tukar jaga."}), 400
+
+    try:
+        tgl = datetime.strptime(tgl_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({"error": "Format tanggal harus YYYY-MM-DD."}), 400
+
+    user_a = User.query.get(int(user_a_id))
+    user_b = User.query.get(int(user_b_id))
+    if not user_a or not user_b:
+        return jsonify({"error": "Salah satu pegawai tidak ditemukan."}), 404
+
+    if current_user.role == 'admin_opd':
+        if user_a.opd_id != current_user.opd_id or user_b.opd_id != current_user.opd_id:
+            return jsonify({"error": "Kedua pegawai harus berasal dari instansi OPD Anda."}), 403
+
+    shift_a = _resolve_active_shift(user_a, tgl)
+    shift_b = _resolve_active_shift(user_b, tgl)
+
+    if not shift_a.get("id") or not shift_b.get("id"):
+        return jsonify({"error": "Pastikan kedua pegawai memiliki profil jam kerja aktif."}), 400
+
+    ket_a = catatan or f"Tukar Jaga dengan {user_b.nama_lengkap}"
+    ket_b = catatan or f"Tukar Jaga dengan {user_a.nama_lengkap}"
+
+    roster_a = RosterJadwalShift.query.filter_by(user_id=user_a.id, tanggal=tgl).first()
+    if roster_a:
+        roster_a.jam_kerja_id = shift_b["id"]
+        roster_a.keterangan = ket_a
+    else:
+        db.session.add(RosterJadwalShift(user_id=user_a.id, tanggal=tgl, jam_kerja_id=shift_b["id"], keterangan=ket_a))
+
+    roster_b = RosterJadwalShift.query.filter_by(user_id=user_b.id, tanggal=tgl).first()
+    if roster_b:
+        roster_b.jam_kerja_id = shift_a["id"]
+        roster_b.keterangan = ket_b
+    else:
+        db.session.add(RosterJadwalShift(user_id=user_b.id, tanggal=tgl, jam_kerja_id=shift_a["id"], keterangan=ket_b))
+
+    db.session.commit()
+    catat_audit(
+        current_user.id, 'SWAP_ROSTER', 'roster_jadwal_shift',
+        f"Tukar jaga tanggal {tgl_str}: {user_a.nama_lengkap} ({shift_a['nama_shift']} -> {shift_b['nama_shift']}) <-> {user_b.nama_lengkap}",
+        target_record_id=f"{user_a.id}-{user_b.id}"
+    )
+    return jsonify({
+        "message": f"Tukar jaga tanggal {tgl_str} antara {user_a.nama_lengkap} dan {user_b.nama_lengkap} berhasil disimpan."
+    }), 200

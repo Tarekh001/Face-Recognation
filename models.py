@@ -75,10 +75,12 @@ class User(db.Model):
     password_hash = db.Column(db.String(255), nullable=True)
     is_face_registered = db.Column(db.Boolean, default=False)
     approval_status = db.Column(db.String(20), default='approved')  # 'pending', 'approved', 'rejected'
+    jam_kerja_id = db.Column(db.Integer, db.ForeignKey('master_jam_kerja.id', ondelete='SET NULL'), nullable=True)
     created_at = db.Column(db.DateTime, default=get_wib_time)
 
     # Menghubungkan user_pin ke tabel presensi dengan Logical Primary Join
     presensi = db.relationship('Presensi', primaryjoin="User.pin == Presensi.user_pin", foreign_keys="[Presensi.user_pin]", backref='pegawai', lazy=True)
+    jam_kerja_default = db.relationship('MasterJamKerja', foreign_keys=[jam_kerja_id], lazy=True)
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
@@ -134,11 +136,15 @@ class Presensi(db.Model):
     tipe_absen = db.Column(db.String(10), nullable=False) 
     status_kehadiran = db.Column(db.String(20), default='ON_TIME')
     keterlambatan_menit = db.Column(db.Integer, default=0)
-    # ── Kolom baru untuk Jadwal Kegiatan (Geofencing) & Bukti Foto Harian ──
+    # ── Kolom untuk Jadwal Kegiatan (Geofencing), Bukti Foto Harian, & Shift Lintas Hari ──
     latitude_scan = db.Column(db.Float, nullable=True)
     longitude_scan = db.Column(db.Float, nullable=True)
     kegiatan_id = db.Column(db.Integer, db.ForeignKey('jadwal_kegiatan.id'), nullable=True)
     foto_presensi = db.Column(db.Text, nullable=True)
+    tanggal_tugas = db.Column(db.Date, nullable=True, index=True)
+    jam_kerja_id = db.Column(db.Integer, db.ForeignKey('master_jam_kerja.id', ondelete='SET NULL'), nullable=True)
+
+    jam_kerja = db.relationship('MasterJamKerja', foreign_keys=[jam_kerja_id], lazy=True)
 
 # 7. Tabel Pengaturan Sistem (Key-Value)
 class AppSetting(db.Model):
@@ -221,3 +227,38 @@ class PresensiKegiatan(db.Model):
         db.UniqueConstraint('kegiatan_id', 'nip', name='uq_presensi_kegiatan_nip'),
     )
 
+# 12. Tabel Master Jam Kerja (Multi-Shift & Jam Kerja OPD)
+class MasterJamKerja(db.Model):
+    __tablename__ = 'master_jam_kerja'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    nama_shift = db.Column(db.String(100), nullable=False)
+    jam_masuk = db.Column(db.Time, nullable=False)
+    jam_pulang = db.Column(db.Time, nullable=False)
+    mulai_scan_masuk = db.Column(db.Time, nullable=False)
+    akhir_scan_masuk = db.Column(db.Time, nullable=False)
+    mulai_scan_pulang = db.Column(db.Time, nullable=False)
+    akhir_scan_pulang = db.Column(db.Time, nullable=False)
+    menit_toleransi = db.Column(db.Integer, default=0, nullable=False)
+    is_lintas_hari = db.Column(db.Boolean, default=False, nullable=False)
+    abaikan_libur = db.Column(db.Boolean, default=False, nullable=False)
+    opd_id = db.Column(db.Integer, db.ForeignKey('master_opd.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, default=get_wib_time)
+
+    opd = db.relationship('MasterOpd', backref=db.backref('jam_kerja_list', lazy=True), foreign_keys=[opd_id])
+
+# 13. Tabel Roster Jadwal Shift Bergulir (Fase 2 Dynamic Rolling Roster)
+class RosterJadwalShift(db.Model):
+    __tablename__ = 'roster_jadwal_shift'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.user_id', ondelete='CASCADE'), nullable=False, index=True)
+    tanggal = db.Column(db.Date, nullable=False, index=True)
+    jam_kerja_id = db.Column(db.Integer, db.ForeignKey('master_jam_kerja.id', ondelete='RESTRICT'), nullable=False)
+    keterangan = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, default=get_wib_time)
+
+    user = db.relationship('User', backref=db.backref('roster_list', lazy=True, cascade='all, delete-orphan'))
+    jam_kerja = db.relationship('MasterJamKerja', backref=db.backref('roster_entries', lazy=True))
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'tanggal', name='uq_roster_user_tanggal'),
+    )
