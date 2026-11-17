@@ -4,7 +4,29 @@ import pickle
 import math
 import jwt
 import shutil
-from models import db, User, Presensi, MasterOpd, AuditLog, Device, SnMesin, UserAksesOpd, DataPegawai, UserAdmin, AppSetting, HariLiburCustom, JadwalKegiatan, UndanganKegiatan, PresensiKegiatan, MasterJamKerja, RosterJadwalShift
+from models import (
+    db,
+    User,
+    UserAsn,
+    UserNonAsn,
+    Presensi,
+    PresensiAsn,
+    PresensiNonAsn,
+    MasterOpd,
+    AuditLog,
+    Device,
+    SnMesin,
+    UserAksesOpd,
+    DataPegawai,
+    UserAdmin,
+    AppSetting,
+    HariLiburCustom,
+    JadwalKegiatan,
+    UndanganKegiatan,
+    PresensiKegiatan,
+    MasterJamKerja,
+    RosterJadwalShift,
+)
 from functools import wraps
 from flask import Blueprint, request, jsonify
 from api.facenet_utils import get_embedding, get_embeddings, compare_faces, read_txt, is_valid_image, register_user_and_generate_embeddings
@@ -441,19 +463,27 @@ def _get_global_fallback_shift_dict():
 def _resolve_active_shift(user, target_date, roster_lookup=None, shifts_by_id=None, global_fallback=None):
     """
     Prioritas Penentuan Shift Pegawai pada `target_date`:
-      1. Roster Jadwal Shift (`roster_jadwal_shift`) pada tanggal tersebut
-      2. Default Shift Pegawai (`users.jam_kerja_id`)
+      1. Roster Jadwal Shift (`roster_jadwal_shift`) pada tanggal tersebut (user_id untuk ASN, non_asn_id untuk Non-ASN)
+      2. Default Shift Pegawai (`jam_kerja_id` pada users_asn / users_non_asn)
       3. Fallback Global Default (`AppSetting` / Reguler ASN)
     """
     if user:
+        is_non_asn = isinstance(user, UserNonAsn) or getattr(user, 'role', '') == 'non_asn'
+        domain_key = 'non_asn' if is_non_asn else 'asn'
         if roster_lookup is not None:
-            r_entry = roster_lookup.get((user.id, target_date))
+            r_entry = (
+                roster_lookup.get((domain_key, user.id, target_date))
+                or (None if is_non_asn else roster_lookup.get((user.id, target_date)))
+            )
             if r_entry:
                 s_obj = shifts_by_id.get(r_entry.jam_kerja_id) if shifts_by_id else r_entry.jam_kerja
                 if s_obj:
                     return _shift_model_to_dict(s_obj, source="ROSTER", keterangan=r_entry.keterangan)
         else:
-            r_entry = RosterJadwalShift.query.filter_by(user_id=user.id, tanggal=target_date).first()
+            if is_non_asn:
+                r_entry = RosterJadwalShift.query.filter_by(non_asn_id=user.id, tanggal=target_date).first()
+            else:
+                r_entry = RosterJadwalShift.query.filter_by(user_id=user.id, tanggal=target_date).first()
             if r_entry and r_entry.jam_kerja:
                 return _shift_model_to_dict(r_entry.jam_kerja, source="ROSTER", keterangan=r_entry.keterangan)
 
@@ -552,21 +582,32 @@ def predict():
 
     if best_nip != "unknown" and best_similarity >= THRESHOLD:
         similarity_pct = float(round(best_similarity * 100, 1))
-        user = User.query.filter_by(nip=best_nip).first()
+        user = UserAsn.query.filter_by(nip=best_nip).first() or UserNonAsn.query.filter_by(nik=best_nip).first()
         if user:
+            is_non_asn_user = isinstance(user, UserNonAsn)
             # ── Cek Approval Status ──
             if user.approval_status == 'pending':
                 try:
                     if os.path.exists(image_path): os.remove(image_path)
                 except Exception: pass
-                print(f"\n🟡 [FACE-AI] PENDING: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Menunggu persetujuan Admin")
+                print(f"\n🟡 [FACE-AI] PENDING: {user.nama_lengkap} (ID: {best_nip}) | Similarity: {similarity_pct}% | Menunggu persetujuan Admin")
                 return jsonify({"error": "Akun Anda sedang menunggu persetujuan Admin."}), 403
             if user.approval_status == 'rejected':
                 try:
                     if os.path.exists(image_path): os.remove(image_path)
                 except Exception: pass
-                print(f"\n🔴 [FACE-AI] REJECTED: {user.nama_lengkap} (NIP: {best_nip}) | Registrasi ditolak oleh Admin")
+                print(f"\n🔴 [FACE-AI] REJECTED: {user.nama_lengkap} (ID: {best_nip}) | Registrasi ditolak oleh Admin")
                 return jsonify({"error": "Registrasi Anda telah ditolak oleh Admin."}), 403
+
+            # Isolasi OPD untuk Non-ASN (Non-ASN hanya boleh absen di perangkat OPD-nya sendiri)
+            if is_non_asn_user and device.opd_id and user.opd_id != device.opd_id:
+                try:
+                    if os.path.exists(image_path): os.remove(image_path)
+                except Exception: pass
+                return jsonify({
+                    "error": "OPDMismatch",
+                    "message": "Tenaga Non-ASN hanya dapat melakukan presensi pada perangkat Kiosk instansinya sendiri."
+                }), 403
 
             # Update statistik device
             device.last_activity = get_wib_time()
@@ -598,20 +639,18 @@ def predict():
             status_absen = None
             tanggal_tugas = today
             active_shift = None
+            TargetPresensiModel = PresensiNonAsn if is_non_asn_user else PresensiAsn
+            identity_col = PresensiNonAsn.nik if is_non_asn_user else PresensiAsn.nip
 
             # ── RULE 2: OVERNIGHT PARADOX (Cek Shift Lintas Hari Kemarin Terlebih Dahulu) ──
             shift_yesterday = _resolve_active_shift(user, yesterday)
             if shift_yesterday.get("is_lintas_hari") and (
                 shift_yesterday["mulai_scan_pulang"] <= ct <= shift_yesterday["akhir_scan_pulang"]
             ):
-                # Cek apakah ada sesi shift malam kemarin atau memang jadwal lintas hari kemarin
-                in_yesterday = Presensi.query.filter(
-                    Presensi.user_pin == attendance_id,
-                    Presensi.tipe_absen == "IN",
-                    db.or_(
-                        Presensi.tanggal_tugas == yesterday,
-                        db.and_(Presensi.tanggal_tugas.is_(None), db.func.date(Presensi.waktu_scan) == yesterday)
-                    )
+                in_yesterday = TargetPresensiModel.query.filter(
+                    identity_col == attendance_id,
+                    TargetPresensiModel.tipe_absen == "IN",
+                    TargetPresensiModel.tanggal_tugas == yesterday
                 ).first()
                 if in_yesterday or shift_yesterday.get("source") == "ROSTER":
                     status_absen = "OUT"
@@ -647,7 +686,7 @@ def predict():
                     try:
                         if os.path.exists(image_path): os.remove(image_path)
                     except Exception: pass
-                    print(f"\n🟡 [FACE-AI] OUT OF HOURS: {user.nama_lengkap} (NIP: {best_nip}) | Shift: {active_shift['nama_shift']} | Waktu: {now.strftime('%H:%M:%S')}")
+                    print(f"\n🟡 [FACE-AI] OUT OF HOURS: {user.nama_lengkap} (ID: {best_nip}) | Shift: {active_shift['nama_shift']} | Waktu: {now.strftime('%H:%M:%S')}")
                     return jsonify({
                         "message": (
                             f"Maaf {user.nama_lengkap}, sekarang di luar jam presensi {active_shift['nama_shift']} "
@@ -656,21 +695,18 @@ def predict():
                         )
                     }), 403
 
-            # 2. Validasi Duplikat berdasarkan (user_pin, tanggal_tugas, tipe_absen)
-            existing_log = Presensi.query.filter(
-                Presensi.user_pin == attendance_id,
-                Presensi.tipe_absen == status_absen,
-                db.or_(
-                    Presensi.tanggal_tugas == tanggal_tugas,
-                    db.and_(Presensi.tanggal_tugas.is_(None), db.func.date(Presensi.waktu_scan) == tanggal_tugas)
-                )
+            # 2. Validasi Duplikat berdasarkan (nip/nik, tanggal_tugas, tipe_absen)
+            existing_log = TargetPresensiModel.query.filter(
+                identity_col == attendance_id,
+                TargetPresensiModel.tipe_absen == status_absen,
+                TargetPresensiModel.tanggal_tugas == tanggal_tugas
             ).first()
 
             if existing_log:
                 try:
                     if os.path.exists(image_path): os.remove(image_path)
                 except Exception: pass
-                print(f"\n🟡 [FACE-AI] DUPLICATE: {user.nama_lengkap} (NIP: {best_nip}) | Similarity: {similarity_pct}% | Sudah {status_absen} untuk tanggal tugas {tanggal_tugas}\n")
+                print(f"\n🟡 [FACE-AI] DUPLICATE: {user.nama_lengkap} (ID: {best_nip}) | Similarity: {similarity_pct}% | Sudah {status_absen} untuk tanggal tugas {tanggal_tugas}\n")
                 return jsonify({"message": f"Anda sudah melakukan presensi {status_absen} untuk jadwal tanggal {tanggal_tugas.strftime('%d-%m-%Y')}."}), 400
 
             # 3. RULE 3: Hitung Keterlambatan Terpusat (Grace Period = jam_masuk + menit_toleransi)
@@ -685,7 +721,7 @@ def predict():
                     delta = now - batas_dt
                     keterlambatan_menit = int(delta.total_seconds() // 60)
 
-            # 4. Kompresi Foto Bukti Presensi (WebP ~30 KB) & Simpan ke Database
+            # 4. Kompresi Foto Bukti Presensi (WebP ~30 KB) & Simpan ke Tabel Spesifik (presensi_asn vs presensi_non_asn)
             foto_url = _save_presensi_photo_webp(image_path, attendance_id, status_absen, now)
             try:
                 if os.path.exists(image_path):
@@ -693,19 +729,48 @@ def predict():
             except Exception:
                 pass
 
-            new_log = Presensi(
-                user_pin=attendance_id,
-                device_sn=device_klien_sn,
-                waktu_scan=now,
-                tipe_absen=status_absen,
-                status_kehadiran=status_kehadiran,
-                keterlambatan_menit=keterlambatan_menit,
-                foto_presensi=foto_url,
-                tanggal_tugas=tanggal_tugas,
-                jam_kerja_id=active_shift.get("id")
-            )
+            if is_non_asn_user:
+                new_log = PresensiNonAsn(
+                    non_asn_id=user.id,
+                    nik=user.nik,
+                    nama_lengkap=user.nama_lengkap,
+                    opd_id=user.opd_id,
+                    jam_kerja_id=active_shift.get("id"),
+                    tanggal_tugas=tanggal_tugas,
+                    waktu_scan=now,
+                    tipe_absen=status_absen,
+                    status_kehadiran=status_kehadiran,
+                    keterlambatan_menit=keterlambatan_menit,
+                    device_sn=device_klien_sn,
+                    foto_presensi=foto_url,
+                )
+            else:
+                new_log = PresensiAsn(
+                    user_id=user.id,
+                    nip=user.nip,
+                    user_pin=user.pin,
+                    nama_lengkap=user.nama_lengkap,
+                    opd_id=user.opd_id or device.opd_id,
+                    jam_kerja_id=active_shift.get("id"),
+                    tanggal_tugas=tanggal_tugas,
+                    waktu_scan=now,
+                    tipe_absen=status_absen,
+                    status_kehadiran=status_kehadiran,
+                    keterlambatan_menit=keterlambatan_menit,
+                    device_sn=device_klien_sn,
+                    foto_presensi=foto_url,
+                    spot_sync_status='pending',
+                )
             db.session.add(new_log)
             db.session.commit()
+
+            # Trigger non-blocking SPOT push for ASN attendance if configured
+            if not is_non_asn_user:
+                try:
+                    from api.spot_sync import push_attlog_to_spot_safe
+                    push_attlog_to_spot_safe(new_log)
+                except Exception as spot_err:
+                    print(f"⚠️ [SPOT-SYNC] Peringatan sinkronisasi SPOT: {spot_err}")
 
             late_info = f" | Terlambat: {keterlambatan_menit} menit" if status_kehadiran == "LATE" else ""
             sync_tag = " [OFFLINE-SYNC]" if is_offline_sync else ""
@@ -918,7 +983,13 @@ def get_report(current_user):
         RosterJadwalShift.tanggal >= start_date,
         RosterJadwalShift.tanggal <= end_date
     ).all()
-    roster_lookup = {(r.user_id, r.tanggal): r for r in roster_rows}
+    roster_lookup = {}
+    for r in roster_rows:
+        if r.user_id is not None:
+            roster_lookup[('asn', r.user_id, r.tanggal)] = r
+            roster_lookup[(r.user_id, r.tanggal)] = r
+        if r.non_asn_id is not None:
+            roster_lookup[('non_asn', r.non_asn_id, r.tanggal)] = r
 
     # RULE 4: Pre-load PresensiKegiatan (Dinas Luar Override) in date range
     kegiatan_logs = db.session.query(PresensiKegiatan, JadwalKegiatan).join(
@@ -933,91 +1004,87 @@ def get_report(current_user):
         if d_key not in dinas_luar_lookup:
             dinas_luar_lookup[d_key] = (pk, kg)
 
-    # ────────────────────────────────────────────────────────
-    # STEP 1: Ambil SEMUA log presensi berdasarkan tanggal_tugas (atau date(waktu_scan))
-    # ────────────────────────────────────────────────────────
-    effective_log_date = db.func.coalesce(Presensi.tanggal_tugas, db.func.date(Presensi.waktu_scan))
-    presensi_q = Presensi.query.filter(
-        effective_log_date >= start_date,
-        effective_log_date <= end_date,
-    )
-    if kegiatan_id_filter:
-        presensi_q = presensi_q.filter(Presensi.kegiatan_id == kegiatan_id_filter)
+    include_asn = role_filter != 'non_asn'
+    include_non_asn = role_filter in ('', 'non_asn')
 
-    if target_roles:
-        presensi_q = presensi_q.join(
-            User,
-            db.or_(Presensi.user_pin == User.nip, Presensi.user_pin == User.pin)
-        ).filter(User.role.in_(target_roles))
+    # Pre-load populasi pegawai ASN & Non-ASN untuk lookup O(1) dan pembuatan baris virtual
+    asn_q = UserAsn.query
+    non_asn_q = UserNonAsn.query
+    if effective_opd_id:
+        asn_q = asn_q.filter_by(opd_id=effective_opd_id)
+        non_asn_q = non_asn_q.filter_by(opd_id=effective_opd_id)
+    if target_roles and role_filter not in ('asn', 'non_asn'):
+        asn_q = asn_q.filter(UserAsn.role.in_(target_roles))
 
-    if current_user.role == 'admin_opd':
-        opd_device_sns = [d.sn for d in Device.query.filter_by(opd_id=current_user.opd_id).all()]
-        if opd_device_sns:
-            presensi_q = presensi_q.filter(Presensi.device_sn.in_(opd_device_sns))
-        else:
-            presensi_q = presensi_q.filter(False)
+    known_asn_users = [u for u in asn_q.all() if _is_employee_account(u)] if include_asn else []
+    known_non_asn_users = list(non_asn_q.all()) if include_non_asn else []
+    known_users = known_asn_users + known_non_asn_users
 
-    all_logs = presensi_q.all()
+    user_by_identity = {}
+    for u in known_asn_users:
+        user_by_identity[u.nip] = u
+        if u.pin:
+            user_by_identity[u.pin] = u
+    for u in known_non_asn_users:
+        user_by_identity[u.nik] = u
 
     # ────────────────────────────────────────────────────────
-    # STEP 2: Resolve identity via data_pegawai & User
+    # STEP 1: Ambil log presensi dari presensi_asn dan/atau presensi_non_asn
     # ────────────────────────────────────────────────────────
-    unique_ids = set(log.user_pin for log in all_logs if log.user_pin)
-    pin_identity = {}
-    user_by_uid = {}
-    for uid in unique_ids:
-        user = User.query.filter_by(nip=uid).first() or User.query.filter_by(pin=uid).first()
-        user_by_uid[uid] = user
-        user_role = user.role if user else 'asn'
-        user_opd_id = user.opd_id if user else None
-        user_opd_nama = (user.opd.nama_opd if user and user.opd else None)
-        pegawai = DataPegawai.query.filter_by(nip=uid).first() or DataPegawai.query.filter_by(pin=uid).first()
-        if pegawai:
-            pin_identity[uid] = {
-                "nip": pegawai.nip,
-                "pin": user.pin if user else pegawai.pin,
-                "nama": pegawai.nama_lengkap,
-                "role": user_role,
-                "opd_id": user_opd_id,
-                "nama_opd": user_opd_nama,
-            }
-        elif user:
-            pin_identity[uid] = {
-                "nip": user.nip or uid,
-                "pin": user.pin,
-                "nama": user.nama_lengkap,
-                "role": user_role,
-                "opd_id": user_opd_id,
-                "nama_opd": user_opd_nama,
-            }
-        else:
-            pin_identity[uid] = {
-                "nip": uid,
-                "pin": uid,
-                "nama": f"Unknown ({uid})",
-                "role": "asn",
-                "opd_id": None,
-                "nama_opd": None,
-            }
+    all_logs = []
+    if include_asn:
+        pa_q = PresensiAsn.query.filter(
+            PresensiAsn.tanggal_tugas >= start_date,
+            PresensiAsn.tanggal_tugas <= end_date,
+        )
+        if effective_opd_id:
+            pa_q = pa_q.filter(PresensiAsn.opd_id == effective_opd_id)
+        all_logs.extend(pa_q.all())
+
+    if include_non_asn:
+        pna_q = PresensiNonAsn.query.filter(
+            PresensiNonAsn.tanggal_tugas >= start_date,
+            PresensiNonAsn.tanggal_tugas <= end_date,
+        )
+        if effective_opd_id:
+            pna_q = pna_q.filter(PresensiNonAsn.opd_id == effective_opd_id)
+        all_logs.extend(pna_q.all())
+
+    opds_by_id = {o.id: o.nama_opd for o in MasterOpd.query.all()}
+    mesin_by_sn = {m.sn: m.nama_lokasi for m in SnMesin.query.all()}
 
     # ────────────────────────────────────────────────────────
-    # STEP 3: Index logs by (pin, tanggal_tugas) and group IN/OUT (Rule 1 & Rule 2)
+    # STEP 2 & 3: Index logs by (identity_nip_or_nik, tanggal_tugas) and group IN/OUT
     # ────────────────────────────────────────────────────────
     logs_index = {}
     for log in all_logs:
+        log_id_str = log.nik if isinstance(log, PresensiNonAsn) else log.nip
         log_duty_date = log.tanggal_tugas if log.tanggal_tugas else log.waktu_scan.date()
-        key = (log.user_pin, log_duty_date)
+        key = (log_id_str, log_duty_date)
         logs_index.setdefault(key, []).append(log)
 
     existing_keys = set(logs_index.keys())
     report_data = []
-    for (pin, log_date), logs in logs_index.items():
-        identity = pin_identity.get(pin, {"nip": pin, "nama": f"Unknown ({pin})"})
-        user_obj = user_by_uid.get(pin)
-        if identity.get("nip"):
-            existing_keys.add((identity["nip"], log_date))
-        if identity.get("pin"):
-            existing_keys.add((identity["pin"], log_date))
+    for (ident_key, log_date), logs in logs_index.items():
+        sample_log = logs[0]
+        is_na_log = isinstance(sample_log, PresensiNonAsn)
+        user_obj = user_by_identity.get(ident_key)
+        if not user_obj:
+            user_obj = (
+                UserNonAsn.query.filter_by(nik=ident_key).first()
+                if is_na_log
+                else UserAsn.query.filter_by(nip=ident_key).first()
+            )
+            if user_obj:
+                user_by_identity[ident_key] = user_obj
+
+        if user_obj and getattr(user_obj, 'pin', None):
+            existing_keys.add((user_obj.pin, log_date))
+
+        row_role = 'non_asn' if is_na_log else (user_obj.role if user_obj else 'asn')
+        row_opd_id = sample_log.opd_id or (user_obj.opd_id if user_obj else None)
+        row_opd_nama = opds_by_id.get(row_opd_id)
+        row_nama = sample_log.nama_lengkap or (user_obj.nama_lengkap if user_obj else ident_key)
 
         in_logs = [l for l in logs if l.tipe_absen == 'IN']
         out_logs = [l for l in logs if l.tipe_absen == 'OUT']
@@ -1025,7 +1092,6 @@ def get_report(current_user):
         earliest_in = min(in_logs, key=lambda l: l.waktu_scan) if in_logs else None
         latest_out = max(out_logs, key=lambda l: l.waktu_scan) if out_logs else None
 
-        # Resolve shift used for this attendance record
         recorded_shift_id = (
             (earliest_in.jam_kerja_id if earliest_in and earliest_in.jam_kerja_id else None)
             or (latest_out.jam_kerja_id if latest_out and latest_out.jam_kerja_id else None)
@@ -1056,21 +1122,21 @@ def get_report(current_user):
                 status_keluar = "MISSING"
 
         active_sn = earliest_in.device_sn if earliest_in else (latest_out.device_sn if latest_out else None)
-        lokasi = None
-        if active_sn:
-            mesin = SnMesin.query.get(active_sn)
-            lokasi = mesin.nama_lokasi if mesin else None
+        lokasi = mesin_by_sn.get(active_sn) if active_sn else None
 
         foto_masuk_url = getattr(earliest_in, 'foto_presensi', None) if earliest_in else None
         foto_keluar_url = getattr(latest_out, 'foto_presensi', None) if latest_out else None
         primary_foto_url = foto_masuk_url or foto_keluar_url
 
+        primary_spot_row = latest_out or earliest_in
+        spot_synced_dt = getattr(primary_spot_row, "spot_synced_at", None) if not is_na_log else None
+
         report_data.append({
-            "nip": identity["nip"],
-            "nama": identity["nama"],
-            "role": identity.get("role", "asn"),
-            "opd_id": identity.get("opd_id"),
-            "nama_opd": identity.get("nama_opd"),
+            "nip": ident_key,
+            "nama": row_nama,
+            "role": row_role,
+            "opd_id": row_opd_id,
+            "nama_opd": row_opd_nama,
             "tanggal": log_date.strftime("%Y-%m-%d"),
             "jam_masuk": earliest_in.waktu_scan.strftime("%H:%M:%S") if earliest_in else None,
             "status_masuk": earliest_in.status_kehadiran if earliest_in else "ON_TIME",
@@ -1090,26 +1156,14 @@ def get_report(current_user):
             "sumber_jadwal": active_shift["source"],
             "is_dinas_luar": False,
             "nama_kegiatan": None,
+            "spot_sync_status": None if is_na_log else getattr(primary_spot_row, "spot_sync_status", "pending"),
+            "spot_synced_at": spot_synced_dt.strftime("%Y-%m-%d %H:%M:%S") if spot_synced_dt else None,
+            "spot_response": None if is_na_log else getattr(primary_spot_row, "spot_response", None),
         })
-
-    # SECURITY FIX: Enforce tenant isolation / OPD filter on presensi-derived rows
-    if effective_opd_id:
-        opd_nips = set(
-            u.nip for u in User.query.filter_by(opd_id=effective_opd_id).all()
-            if u.nip and _is_employee_account(u)
-        )
-        report_data = [r for r in report_data if str(r['nip']) in opd_nips]
 
     # ────────────────────────────────────────────────────────
     # STEP 4: Generate virtual rows (Dinas Luar Override or ABSENT) for ALL real employees
     # ────────────────────────────────────────────────────────
-    known_users_q = User.query
-    if effective_opd_id:
-        known_users_q = known_users_q.filter_by(opd_id=effective_opd_id)
-    if target_roles:
-        known_users_q = known_users_q.filter(User.role.in_(target_roles))
-    known_users = [u for u in known_users_q.all() if _is_employee_account(u)]
-
     id_holidays_cache = {}
     custom_holidays_in_range = HariLiburCustom.query.filter(
         HariLiburCustom.tanggal >= start_date,
@@ -1125,12 +1179,11 @@ def get_report(current_user):
 
         if current_date <= today:
             for u in known_users:
-                attendance_id = u.nip if u.nip else u.pin
+                attendance_id = u.nip
                 if not attendance_id:
                     continue
                 already_logged = (
                     (attendance_id, current_date) in existing_keys
-                    or (u.nip and (u.nip, current_date) in existing_keys)
                     or (u.pin and (u.pin, current_date) in existing_keys)
                 )
                 if already_logged:
@@ -1146,11 +1199,11 @@ def get_report(current_user):
                 if dl_match:
                     pk, kg = dl_match
                     report_data.append({
-                        "nip": u.nip or attendance_id,
+                        "nip": u.nip,
                         "nama": u.nama_lengkap,
                         "role": u.role,
                         "opd_id": u.opd_id,
-                        "nama_opd": u.opd.nama_opd if u.opd else None,
+                        "nama_opd": opds_by_id.get(u.opd_id),
                         "tanggal": current_date.strftime("%Y-%m-%d"),
                         "jam_masuk": pk.waktu_scan.strftime("%H:%M:%S"),
                         "status_masuk": "ON_TIME",
@@ -1173,20 +1226,16 @@ def get_report(current_user):
                     })
                     continue
 
-                # RULE 5: Pada hari libur/akhir pekan, hanya pegawai yang ter-plot di Roster dengan shift `abaikan_libur=True` yang diwajibkan hadir
                 should_work_today = (not is_holiday) or (
                     active_shift["abaikan_libur"] and active_shift["source"] == "ROSTER"
                 )
                 if should_work_today:
-                    identity = pin_identity.get(attendance_id)
-                    if not identity:
-                        identity = {"nip": u.nip or attendance_id, "nama": u.nama_lengkap}
                     report_data.append({
-                        "nip": identity["nip"],
-                        "nama": identity["nama"],
+                        "nip": u.nip,
+                        "nama": u.nama_lengkap,
                         "role": u.role,
                         "opd_id": u.opd_id,
-                        "nama_opd": u.opd.nama_opd if u.opd else None,
+                        "nama_opd": opds_by_id.get(u.opd_id),
                         "tanggal": current_date.strftime("%Y-%m-%d"),
                         "jam_masuk": None,
                         "status_masuk": "ABSENT",
@@ -1283,46 +1332,56 @@ def get_manage_asn(current_user):
     today = get_wib_time().date()
     role_filter = request.args.get('role', '', type=str).lower()
 
-    if current_user.role == 'super_admin':
-        users = [u for u in User.query.all() if _is_employee_account(u)]
-    else:
-        primary_users = User.query.filter_by(opd_id=current_user.opd_id).all()
+    include_asn = role_filter != 'non_asn'
+    include_non_asn = role_filter in ('', 'non_asn')
 
-        cross_nips = [a.user_nip for a in UserAksesOpd.query.filter_by(
-            opd_id=current_user.opd_id, approval_status='approved'
-        ).all()]
-        cross_users = User.query.filter(
-            User.nip.in_(cross_nips)
-        ).all() if cross_nips else []
+    users = []
+    if include_asn:
+        if current_user.role == 'super_admin':
+            asn_users = [u for u in UserAsn.query.all() if _is_employee_account(u)]
+        else:
+            primary_users = UserAsn.query.filter_by(opd_id=current_user.opd_id).all()
+            cross_nips = [a.user_nip for a in UserAksesOpd.query.filter_by(
+                opd_id=current_user.opd_id, approval_status='approved'
+            ).all()]
+            cross_users = UserAsn.query.filter(
+                UserAsn.nip.in_(cross_nips)
+            ).all() if cross_nips else []
 
-        seen_ids = set()
-        users = []
-        for u in primary_users + cross_users:
-            if u.id not in seen_ids and _is_employee_account(u):
-                seen_ids.add(u.id)
-                users.append(u)
+            seen_ids = set()
+            asn_users = []
+            for u in primary_users + cross_users:
+                if u.id not in seen_ids and _is_employee_account(u):
+                    seen_ids.add(u.id)
+                    asn_users.append(u)
 
-    if role_filter == 'asn':
-        users = [u for u in users if u.role in ('asn', 'admin_opd', 'super_admin')]
-    elif role_filter == 'non_asn':
-        users = [u for u in users if u.role == 'non_asn']
-    elif role_filter:
-        users = [u for u in users if u.role == role_filter]
+        if role_filter and role_filter not in ('asn', 'non_asn'):
+            asn_users = [u for u in asn_users if u.role == role_filter]
+        users.extend(asn_users)
+
+    if include_non_asn:
+        if current_user.role == 'super_admin':
+            non_asn_users = UserNonAsn.query.all()
+        else:
+            non_asn_users = UserNonAsn.query.filter_by(opd_id=current_user.opd_id).all()
+        users.extend(non_asn_users)
 
     shifts_by_id = {s.id: s for s in MasterJamKerja.query.all()}
     global_fallback_shift = _get_global_fallback_shift_dict()
 
     data_asn = []
     for user in users:
-        attendance_id = user.nip if user.nip else user.pin
-
-        logs_today = Presensi.query.filter(
-            Presensi.user_pin == attendance_id,
-            db.or_(
-                Presensi.tanggal_tugas == today,
-                db.and_(Presensi.tanggal_tugas.is_(None), db.func.date(Presensi.waktu_scan) == today)
-            )
-        ).all()
+        is_na = isinstance(user, UserNonAsn)
+        if is_na:
+            logs_today = PresensiNonAsn.query.filter(
+                PresensiNonAsn.nik == user.nik,
+                PresensiNonAsn.tanggal_tugas == today
+            ).all()
+        else:
+            logs_today = PresensiAsn.query.filter(
+                PresensiAsn.nip == user.nip,
+                PresensiAsn.tanggal_tugas == today
+            ).all()
 
         status_hari_ini = "Belum Hadir"
         if logs_today:
@@ -1334,7 +1393,7 @@ def get_manage_asn(current_user):
                 status_hari_ini = "Hadir"
 
         cross_opd_list = []
-        if user.nip:
+        if not is_na and user.nip:
             akses_records = UserAksesOpd.query.filter_by(user_nip=user.nip).all()
             for akses in akses_records:
                 opd_target = MasterOpd.query.get(akses.opd_id)
@@ -1348,7 +1407,7 @@ def get_manage_asn(current_user):
         if current_user.role == 'super_admin':
             is_manageable = True
         else:
-            is_manageable = (user.role in ('asn', 'non_asn') or user.id == current_user.id)
+            is_manageable = (user.role in ('asn', 'non_asn') or (not is_na and user.id == current_user.id))
 
         default_shift = (
             _shift_model_to_dict(shifts_by_id[user.jam_kerja_id], source="DEFAULT_USER")
@@ -1512,17 +1571,29 @@ def delete_user(current_user, id):
     if current_user.role not in ['admin_opd', 'super_admin']:
         return jsonify({"message": "Akses ditolak!"}), 403
 
-    user_to_delete = User.query.get(id)
-    if not user_to_delete: return jsonify({"message": "User tidak ditemukan!"}), 404
-    if current_user.role == 'admin_opd' and current_user.opd_id != user_to_delete.opd_id:
-        return jsonify({"message": "Akses ditolak! ASN ini bukan dari instansi Anda."}), 403
+    role_hint = request.args.get('role', '', type=str).lower()
+    if role_hint == 'non_asn':
+        user_to_delete = UserNonAsn.query.get(id)
+    elif role_hint == 'asn':
+        user_to_delete = UserAsn.query.get(id)
+    else:
+        user_to_delete = UserAsn.query.get(id) or UserNonAsn.query.get(id)
 
-    nama_asn = user_to_delete.nama_lengkap
+    if not user_to_delete:
+        return jsonify({"message": "User tidak ditemukan!"}), 404
+    if current_user.role == 'admin_opd' and current_user.opd_id != user_to_delete.opd_id:
+        return jsonify({"message": "Akses ditolak! Pegawai ini bukan dari instansi Anda."}), 403
+
+    is_na = isinstance(user_to_delete, UserNonAsn)
+    nama_pegawai = user_to_delete.nama_lengkap
+    identitas = user_to_delete.nik if is_na else user_to_delete.nip
+    target_tbl = "users_non_asn" if is_na else "users_asn"
+    label = "Non-ASN" if is_na else "ASN"
+
     db.session.delete(user_to_delete)
-    # PERBAIKAN: Gunakan current_user.id
-    catat_audit(current_user.id, "DELETE_USER", "users", f"Menghapus ASN {nama_asn} (NIP: {user_to_delete.nip})")
-    
-    return jsonify({"message": f"ASN {nama_asn} berhasil dihapus!"}), 200
+    catat_audit(current_user.id, "DELETE_USER", target_tbl, f"Menghapus {label} {nama_pegawai} ({identitas})", target_record_id=str(identitas))
+
+    return jsonify({"message": f"{label} {nama_pegawai} berhasil dihapus!"}), 200
 
 # ==========================================
 # 5. REGISTER Wajah (Cross-OPD + Mobile Support)
@@ -1657,11 +1728,11 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
         return jsonify({"error": "Gagal: Instansi (OPD) tujuan tidak ditemukan."}), 404
 
     # =============================================
-    # NON-ASN MODE: Bypass data_pegawai validation
+    # NON-ASN MODE: Disimpan di tabel spesifik users_non_asn
     # =============================================
     if is_non_asn:
-        # Cek duplikat: apakah NIK sudah terdaftar?
-        existing_user = User.query.filter_by(nip=person_nip).first()
+        # Cek duplikat: apakah NIK sudah terdaftar di users_non_asn?
+        existing_user = UserNonAsn.query.filter_by(nik=person_nip).first()
         if existing_user:
             if existing_user.opd_id == target_opd_id:
                 return _handle_biometric_reregistration(existing_user, target_opd, files, actor_id, source)
@@ -1673,11 +1744,9 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
         if status != 200:
             return jsonify(result), status
 
-        new_user = User(
-            nip=person_nip,
-            pin=None,  # Non-ASN tidak punya PIN dari data_pegawai
+        new_user = UserNonAsn(
+            nik=person_nip,
             nama_lengkap=person_name,
-            role='non_asn',
             opd_id=target_opd_id,
             is_face_registered=True,
             approval_status=initial_approval
@@ -1686,8 +1755,9 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
 
         if actor_id:
             catat_audit(
-                actor_id, "REGISTER_NON_ASN", "users",
-                f"Mendaftarkan Non-ASN: {person_name} (NIK: {person_nip}) untuk OPD {target_opd.nama_opd} (source: {source})"
+                actor_id, "REGISTER_NON_ASN", "users_non_asn",
+                f"Mendaftarkan Non-ASN: {person_name} (NIK: {person_nip}) untuk OPD {target_opd.nama_opd} (source: {source})",
+                target_record_id=person_nip
             )
         db.session.commit()
 
@@ -1701,24 +1771,24 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
         }), 200
 
     # =============================================
-    # ASN MODE: Strict validation against data_pegawai
+    # ASN MODE: Strict validation against data_pegawai (disimpan di users_asn)
     # =============================================
     pegawai = DataPegawai.query.filter_by(nip=person_nip).first()
     if not pegawai:
         return jsonify({"error": "Gagal: NIP tidak ditemukan di Data Induk Pegawai. Sinkronkan data dari SPOT terlebih dahulu."}), 400
 
-    # --- Cek apakah user sudah ada ---
-    existing_user = User.query.filter_by(nip=person_nip).first()
+    # --- Cek apakah user ASN sudah ada di users_asn ---
+    existing_user = UserAsn.query.filter_by(nip=person_nip).first()
 
     # =============================================
-    # CONDITION A: User Baru (Belum ada di tabel users)
+    # CONDITION A: User Baru (Belum ada di tabel users_asn)
     # =============================================
     if not existing_user:
         result, status = register_user_and_generate_embeddings(person_nip, person_name, files)
         if status != 200:
             return jsonify(result), status
 
-        new_user = User(
+        new_user = UserAsn(
             nip=person_nip,
             pin=pegawai.pin,
             nama_lengkap=person_name,
@@ -1738,8 +1808,9 @@ def _process_registration(person_nip, person_name, files, target_opd_id, source,
 
         if actor_id:
             catat_audit(
-                actor_id, "REGISTER_ASN", "users",
-                f"Mendaftarkan wajah ASN baru: {person_name} untuk OPD {target_opd.nama_opd} (source: {source})"
+                actor_id, "REGISTER_ASN", "users_asn",
+                f"Mendaftarkan wajah ASN baru: {person_name} untuk OPD {target_opd.nama_opd} (source: {source})",
+                target_record_id=person_nip
             )
         db.session.commit()
 
@@ -1895,17 +1966,20 @@ def register_mobile():
 @api_blueprint.route('/users/update/<string:nip>', methods=['PUT'])
 @token_required
 def update_user_profile(current_user, nip):
-    """Update data ASN (nama, opd) dan opsional re-register wajah dengan foto baru."""
+    """Update data ASN / Non-ASN (nama, opd) dan opsional re-register wajah dengan foto baru."""
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"message": "Akses Ditolak!"}), 403
 
-    user = User.query.filter_by(nip=nip).first()
+    user = UserAsn.query.filter_by(nip=nip).first() or UserNonAsn.query.filter_by(nik=nip).first()
     if not user:
-        return jsonify({"error": f"ASN dengan NIP '{nip}' tidak ditemukan."}), 404
+        return jsonify({"error": f"Pegawai dengan NIP/NIK '{nip}' tidak ditemukan."}), 404
 
-    # Scope check: Admin OPD hanya boleh edit ASN dari OPD-nya sendiri
+    is_na = isinstance(user, UserNonAsn)
+    target_tbl = "users_non_asn" if is_na else "users_asn"
+
+    # Scope check: Admin OPD hanya boleh edit pegawai dari OPD-nya sendiri
     if current_user.role == 'admin_opd' and user.opd_id != current_user.opd_id:
-        return jsonify({"error": "Anda hanya dapat mengedit ASN dari instansi Anda."}), 403
+        return jsonify({"error": "Anda hanya dapat mengedit pegawai dari instansi Anda."}), 403
 
     changes = []
 
@@ -1916,10 +1990,10 @@ def update_user_profile(current_user, nip):
         user.nama_lengkap = new_name
         changes.append(f"Nama: '{old_name}' → '{new_name}'")
 
-        # Update juga di DataPegawai agar konsisten
-        pegawai = DataPegawai.query.filter_by(nip=nip).first()
-        if pegawai:
-            pegawai.nama_lengkap = new_name
+        if not is_na:
+            pegawai = DataPegawai.query.filter_by(nip=nip).first()
+            if pegawai:
+                pegawai.nama_lengkap = new_name
 
     # --- Update OPD ---
     new_opd_id = request.form.get('opd_id', type=int)
@@ -1928,23 +2002,22 @@ def update_user_profile(current_user, nip):
         if not new_opd:
             return jsonify({"error": "OPD tujuan tidak ditemukan."}), 404
         old_opd = user.opd.nama_opd if user.opd else '-'
+        old_opd_id = user.opd_id
         user.opd_id = new_opd_id
         changes.append(f"OPD: '{old_opd}' → '{new_opd.nama_opd}'")
 
-        # Update UserAksesOpd juga
-        akses = UserAksesOpd.query.filter_by(user_nip=nip, opd_id=user.opd_id).first()
-        if akses:
-            akses.opd_id = new_opd_id
+        if not is_na:
+            akses = UserAksesOpd.query.filter_by(user_nip=nip, opd_id=old_opd_id).first()
+            if akses:
+                akses.opd_id = new_opd_id
 
     # --- Re-Register Wajah (Opsional) ---
     files = request.files.getlist('photos')
     if files and len(files) >= 5:
-        # Validasi semua foto
         for file in files:
             if not allowed_file(file.filename) or not is_valid_image(file):
                 return jsonify({"error": "File foto tidak valid. Gunakan format PNG/JPG/JPEG."}), 400
 
-        # Hapus embedding lama
         curr_dir = os.getcwd()
         old_embedding_dir = os.path.join(curr_dir, "samples_embedding", nip)
         old_samples_dir = os.path.join(curr_dir, "samples", nip)
@@ -1956,7 +2029,6 @@ def update_user_profile(current_user, nip):
             shutil.rmtree(old_samples_dir)
             print(f"   🗑️ Sample foto lama untuk {nip} dihapus.")
 
-        # Generate embedding baru
         display_name = new_name or user.nama_lengkap
         result, status = register_user_and_generate_embeddings(nip, display_name, files)
         if status != 200:
@@ -1965,10 +2037,9 @@ def update_user_profile(current_user, nip):
         user.is_face_registered = True
         changes.append(f"Wajah di-registrasi ulang ({len(files)} foto baru)")
 
-        # Catat audit khusus re-register
         catat_audit(
-            current_user.id, "RE_REGISTER_FACE", "users",
-            f"Re-registrasi wajah ASN {user.nama_lengkap} (NIP: {nip}) dengan {len(files)} foto baru",
+            current_user.id, "RE_REGISTER_FACE", target_tbl,
+            f"Re-registrasi wajah {user.nama_lengkap} ({nip}) dengan {len(files)} foto baru",
             target_record_id=nip
         )
     elif files and len(files) < 5:
@@ -1977,8 +2048,8 @@ def update_user_profile(current_user, nip):
     # --- Commit & Audit ---
     if changes:
         catat_audit(
-            current_user.id, "UPDATE_ASN", "users",
-            f"Update profil ASN {user.nama_lengkap}: {'; '.join(changes)}",
+            current_user.id, "UPDATE_USER", target_tbl,
+            f"Update profil {user.nama_lengkap}: {'; '.join(changes)}",
             target_record_id=nip
         )
         db.session.commit()
@@ -1992,28 +2063,30 @@ def update_user_profile(current_user, nip):
 @api_blueprint.route('/users/approve/<string:nip>', methods=['PUT'])
 @token_required
 def approve_user(current_user, nip):
-    """Admin menyetujui atau menolak registrasi ASN (primary atau cross-OPD)."""
+    """Admin menyetujui atau menolak registrasi ASN / Non-ASN (primary atau cross-OPD)."""
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"message": "Akses Ditolak!"}), 403
 
     data = request.get_json()
     new_status = data.get('status', 'approved').lower()
-    target_opd_id = data.get('opd_id')  # Opsional: untuk cross-OPD approval
+    target_opd_id = data.get('opd_id')
 
     if new_status not in ('approved', 'rejected'):
         return jsonify({"error": "Status harus 'approved' atau 'rejected'."}), 400
 
-    user = User.query.filter_by(nip=nip).first()
+    user = UserAsn.query.filter_by(nip=nip).first() or UserNonAsn.query.filter_by(nik=nip).first()
     if not user:
-        return jsonify({"error": f"ASN dengan NIP '{nip}' tidak ditemukan."}), 404
+        return jsonify({"error": f"Pegawai dengan NIP/NIK '{nip}' tidak ditemukan."}), 404
 
-    # --- Cek apakah ini Cross-OPD approval ---
-    if target_opd_id and int(target_opd_id) != user.opd_id:
+    is_na = isinstance(user, UserNonAsn)
+    target_tbl = "users_non_asn" if is_na else "users_asn"
+
+    # --- Cek apakah ini Cross-OPD approval (Khusus ASN) ---
+    if not is_na and target_opd_id and int(target_opd_id) != user.opd_id:
         akses = UserAksesOpd.query.filter_by(user_nip=nip, opd_id=int(target_opd_id)).first()
         if not akses:
             return jsonify({"error": "Akses lintas instansi tidak ditemukan."}), 404
-        
-        # Scope check
+
         if current_user.role == 'admin_opd' and int(target_opd_id) != current_user.opd_id:
             return jsonify({"error": "Anda hanya dapat mengubah status akses dari instansi Anda."}), 403
 
@@ -2038,28 +2111,26 @@ def approve_user(current_user, nip):
 
     # --- Primary user approval ---
     if current_user.role == 'admin_opd' and user.opd_id != current_user.opd_id:
-        return jsonify({"error": "Anda hanya dapat mengubah status ASN dari instansi Anda."}), 403
+        return jsonify({"error": "Anda hanya dapat mengubah status pegawai dari instansi Anda."}), 403
 
     old_status = user.approval_status
     user.approval_status = new_status
 
-    # --- PENTING: Sinkronkan juga status di tabel user_akses_opd ---
-    # Saat registrasi mobile, record dibuat di KEDUA tabel (users + user_akses_opd)
-    # Jadi approval harus update KEDUA tabel agar konsisten
-    akses_primary = UserAksesOpd.query.filter_by(user_nip=nip, opd_id=user.opd_id).first()
-    if akses_primary:
-        akses_primary.approval_status = new_status
+    if not is_na:
+        akses_primary = UserAksesOpd.query.filter_by(user_nip=nip, opd_id=user.opd_id).first()
+        if akses_primary:
+            akses_primary.approval_status = new_status
 
-    action_label = "APPROVE_ASN" if new_status == 'approved' else "REJECT_ASN"
+    action_label = "APPROVE_USER" if new_status == 'approved' else "REJECT_USER"
     catat_audit(
-        current_user.id, action_label, "users",
-        f"Status ASN {user.nama_lengkap} (NIP: {nip}): '{old_status}' -> '{new_status}'",
+        current_user.id, action_label, target_tbl,
+        f"Status {user.nama_lengkap} ({nip}): '{old_status}' -> '{new_status}'",
         target_record_id=nip
     )
     db.session.commit()
 
     status_emoji = "✅" if new_status == 'approved' else "❌"
-    print(f"\n{status_emoji} [APPROVAL] {user.nama_lengkap} (NIP: {nip}): '{old_status}' -> '{new_status}' | By: {current_user.nama_lengkap}")
+    print(f"\n{status_emoji} [APPROVAL] {user.nama_lengkap} ({nip}): '{old_status}' -> '{new_status}' | By: {current_user.nama_lengkap}")
 
     status_label = "disetujui" if new_status == 'approved' else "ditolak"
     return jsonify({
@@ -2074,20 +2145,22 @@ def approve_user(current_user, nip):
 @api_blueprint.route('/users/pending', methods=['GET'])
 @token_required
 def get_pending_users(current_user):
-    """Menampilkan daftar ASN yang menunggu persetujuan."""
+    """Menampilkan daftar ASN & Non-ASN yang menunggu persetujuan."""
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"message": "Akses Ditolak!"}), 403
 
-    query = User.query.filter_by(role='asn', approval_status='pending')
+    q_asn = UserAsn.query.filter_by(role='asn', approval_status='pending')
+    q_na = UserNonAsn.query.filter_by(approval_status='pending')
 
-    # Admin OPD hanya bisa lihat pending dari OPD-nya sendiri
     if current_user.role == 'admin_opd':
-        query = query.filter_by(opd_id=current_user.opd_id)
+        q_asn = q_asn.filter_by(opd_id=current_user.opd_id)
+        q_na = q_na.filter_by(opd_id=current_user.opd_id)
 
-    pending_users = query.order_by(User.created_at.desc()).all()
+    pending_users = list(q_asn.order_by(UserAsn.created_at.desc()).all()) + list(q_na.order_by(UserNonAsn.created_at.desc()).all())
     data = [{
         "nip": u.nip,
         "nama": u.nama_lengkap,
+        "role": u.role,
         "opd": u.opd.nama_opd if u.opd else "-",
         "is_face_registered": u.is_face_registered,
         "created_at": u.created_at.strftime("%Y-%m-%d %H:%M:%S") if u.created_at else None
@@ -2498,8 +2571,8 @@ def manage_opd_detail(current_user, id):
         return jsonify({"message": f"OPD '{opd.nama_opd}' berhasil diperbarui!"}), 200
 
     if request.method == 'DELETE':
-        # Cek apakah masih ada user yang terhubung ke OPD ini
-        user_count = User.query.filter_by(opd_id=id).count()
+        # Cek apakah masih ada user (ASN maupun Non-ASN) yang terhubung ke OPD ini
+        user_count = UserAsn.query.filter_by(opd_id=id).count() + UserNonAsn.query.filter_by(opd_id=id).count()
         if user_count > 0:
             return jsonify({"error": f"Tidak bisa menghapus OPD ini karena masih memiliki {user_count} user terdaftar."}), 400
 
@@ -2934,7 +3007,7 @@ def predict_kegiatan():
         return jsonify({"error": "UNKNOWN_FACE", "message": "Wajah tidak dikenali."}), 401
 
     similarity_pct = float(round(best_similarity * 100, 1))
-    user = User.query.filter_by(nip=best_nip).first()
+    user = UserAsn.query.filter_by(nip=best_nip).first() or UserNonAsn.query.filter_by(nik=best_nip).first()
     if not user:
         return jsonify({"error": "User tidak ditemukan."}), 404
 
@@ -3169,8 +3242,9 @@ def delete_jam_kerja(current_user, shift_id):
             "error": f"Profil '{shift.nama_shift}' sedang dipakai pada {roster_count} jadwal roster aktif. Hapus/ubah jadwal roster terlebih dahulu."
         }), 409
 
-    # Lepas penugasan default pada users sebelum hapus
-    User.query.filter_by(jam_kerja_id=shift.id).update({"jam_kerja_id": None})
+    # Lepas penugasan default pada users_asn & users_non_asn sebelum hapus
+    UserAsn.query.filter_by(jam_kerja_id=shift.id).update({"jam_kerja_id": None})
+    UserNonAsn.query.filter_by(jam_kerja_id=shift.id).update({"jam_kerja_id": None})
     nama = shift.nama_shift
     db.session.delete(shift)
     db.session.commit()
@@ -3190,14 +3264,25 @@ def assign_user_jam_kerja(current_user, user_id):
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"error": "Akses ditolak."}), 403
 
-    target_user = User.query.get(user_id)
+    data = request.get_json() or {}
+    role_hint = (data.get('role') or request.args.get('role') or '').lower()
+    nip_hint = (data.get('nip') or '').strip()
+
+    if nip_hint:
+        target_user = UserAsn.query.filter_by(nip=nip_hint).first() or UserNonAsn.query.filter_by(nik=nip_hint).first()
+    elif role_hint == 'non_asn':
+        target_user = UserNonAsn.query.get(user_id)
+    elif role_hint == 'asn':
+        target_user = UserAsn.query.get(user_id)
+    else:
+        target_user = UserAsn.query.get(user_id) or UserNonAsn.query.get(user_id)
+
     if not target_user:
         return jsonify({"error": "Pegawai tidak ditemukan."}), 404
 
     if current_user.role == 'admin_opd' and target_user.opd_id != current_user.opd_id:
         return jsonify({"error": "Pegawai ini bukan dari instansi OPD Anda."}), 403
 
-    data = request.get_json() or {}
     raw_shift_id = data.get('jam_kerja_id')
     if raw_shift_id in (None, '', 'null', 0, '0'):
         target_user.jam_kerja_id = None
@@ -3211,9 +3296,10 @@ def assign_user_jam_kerja(current_user, user_id):
         target_user.jam_kerja_id = shift.id
         shift_name = shift.nama_shift
 
+    target_tbl = "users_non_asn" if isinstance(target_user, UserNonAsn) else "users_asn"
     db.session.commit()
     catat_audit(
-        current_user.id, 'ASSIGN_JAM_KERJA', 'users',
+        current_user.id, 'ASSIGN_JAM_KERJA', target_tbl,
         f"Menetapkan jam kerja '{shift_name}' untuk {target_user.nama_lengkap} ({target_user.nip})",
         target_record_id=str(target_user.id)
     )
@@ -3228,13 +3314,14 @@ def assign_user_jam_kerja(current_user, user_id):
 @api_blueprint.route('/users/bulk-jam-kerja', methods=['POST'])
 @token_required
 def bulk_assign_user_jam_kerja(current_user):
-    """Menetapkan jam kerja default secara massal berdasarkan daftar user_ids atau nips."""
+    """Menetapkan jam kerja default secara massal berdasarkan daftar user_ids atau nips (mendukung ASN & Non-ASN)."""
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"error": "Akses ditolak."}), 403
 
     data = request.get_json() or {}
     user_ids = data.get('user_ids') or []
     nips = data.get('nips') or []
+    role_hint = (data.get('role') or '').lower()
     raw_shift_id = data.get('jam_kerja_id')
 
     if not user_ids and not nips:
@@ -3248,22 +3335,34 @@ def bulk_assign_user_jam_kerja(current_user):
             return jsonify({"error": "Profil jam kerja tidak ditemukan."}), 404
         shift_name = shift.nama_shift
 
-    q = User.query
-    if user_ids:
-        q = q.filter(User.id.in_([int(uid) for uid in user_ids]))
+    matched_users = []
+    if nips:
+        str_nips = [str(n) for n in nips]
+        q_asn = UserAsn.query.filter(UserAsn.nip.in_(str_nips))
+        q_na = UserNonAsn.query.filter(UserNonAsn.nik.in_(str_nips))
+        if current_user.role == 'admin_opd':
+            q_asn = q_asn.filter_by(opd_id=current_user.opd_id)
+            q_na = q_na.filter_by(opd_id=current_user.opd_id)
+        matched_users = list(q_asn.all()) + list(q_na.all())
     else:
-        q = q.filter(User.nip.in_([str(n) for n in nips]))
+        int_ids = [int(uid) for uid in user_ids]
+        if role_hint != 'non_asn':
+            q_asn = UserAsn.query.filter(UserAsn.id.in_(int_ids))
+            if current_user.role == 'admin_opd':
+                q_asn = q_asn.filter_by(opd_id=current_user.opd_id)
+            matched_users.extend(q_asn.all())
+        if role_hint in ('', 'non_asn'):
+            q_na = UserNonAsn.query.filter(UserNonAsn.id.in_(int_ids))
+            if current_user.role == 'admin_opd':
+                q_na = q_na.filter_by(opd_id=current_user.opd_id)
+            matched_users.extend(q_na.all())
 
-    if current_user.role == 'admin_opd':
-        q = q.filter_by(opd_id=current_user.opd_id)
-
-    matched_users = q.all()
     for u in matched_users:
         u.jam_kerja_id = shift.id if shift else None
 
     db.session.commit()
     catat_audit(
-        current_user.id, 'BULK_ASSIGN_JAM_KERJA', 'users',
+        current_user.id, 'BULK_ASSIGN_JAM_KERJA', 'users_asn/users_non_asn',
         f"Menetapkan jam kerja '{shift_name}' secara massal untuk {len(matched_users)} pegawai",
         target_record_id=str(shift.id if shift else 0)
     )
@@ -3279,7 +3378,7 @@ def bulk_assign_user_jam_kerja(current_user):
 @token_required
 def get_roster_matrix(current_user):
     """
-    Mengambil matriks jadwal shift bulanan pegawai:
+    Mengambil matriks jadwal shift bulanan pegawai (ASN dari users_asn, Non-ASN dari users_non_asn):
     Query params: ?opd_id=X&bulan=MM&tahun=YYYY&role=asn|non_asn
     """
     if current_user.role not in ('super_admin', 'admin_opd'):
@@ -3298,29 +3397,52 @@ def get_roster_matrix(current_user):
     start_dt = date_type(tahun, bulan, 1)
     end_dt = date_type(tahun, bulan, last_day)
 
-    user_q = User.query
-    if effective_opd_id:
-        user_q = user_q.filter_by(opd_id=effective_opd_id)
-    if role_filter == 'asn':
-        user_q = user_q.filter(User.role.in_(['asn', 'admin_opd', 'super_admin']))
-    elif role_filter == 'non_asn':
-        user_q = user_q.filter(User.role == 'non_asn')
+    include_asn = role_filter != 'non_asn'
+    include_non_asn = role_filter in ('', 'non_asn')
 
-    employees = [u for u in user_q.order_by(User.nama_lengkap.asc()).all() if _is_employee_account(u)]
-    emp_ids = [u.id for u in employees]
+    asn_employees = []
+    if include_asn:
+        q_asn = UserAsn.query
+        if effective_opd_id:
+            q_asn = q_asn.filter_by(opd_id=effective_opd_id)
+        asn_employees = [u for u in q_asn.order_by(UserAsn.nama_lengkap.asc()).all() if _is_employee_account(u)]
 
-    roster_rows = RosterJadwalShift.query.filter(
-        RosterJadwalShift.user_id.in_(emp_ids) if emp_ids else False,
-        RosterJadwalShift.tanggal >= start_dt,
-        RosterJadwalShift.tanggal <= end_dt
-    ).all() if emp_ids else []
+    non_asn_employees = []
+    if include_non_asn:
+        q_na = UserNonAsn.query
+        if effective_opd_id:
+            q_na = q_na.filter_by(opd_id=effective_opd_id)
+        non_asn_employees = list(q_na.order_by(UserNonAsn.nama_lengkap.asc()).all())
+
+    employees = asn_employees + non_asn_employees
+    asn_ids = [u.id for u in asn_employees]
+    na_ids = [u.id for u in non_asn_employees]
+
+    roster_rows = []
+    if asn_ids:
+        roster_rows.extend(
+            RosterJadwalShift.query.filter(
+                RosterJadwalShift.user_id.in_(asn_ids),
+                RosterJadwalShift.tanggal >= start_dt,
+                RosterJadwalShift.tanggal <= end_dt
+            ).all()
+        )
+    if na_ids:
+        roster_rows.extend(
+            RosterJadwalShift.query.filter(
+                RosterJadwalShift.non_asn_id.in_(na_ids),
+                RosterJadwalShift.tanggal >= start_dt,
+                RosterJadwalShift.tanggal <= end_dt
+            ).all()
+        )
 
     shifts_by_id = {s.id: s for s in MasterJamKerja.query.all()}
     global_fallback = _get_global_fallback_shift_dict()
 
     roster_map = {}
     for r in roster_rows:
-        uid_str = str(r.user_id)
+        target_uid = r.non_asn_id if r.non_asn_id is not None else r.user_id
+        uid_str = str(target_uid)
         d_str = r.tanggal.strftime("%Y-%m-%d")
         s_obj = shifts_by_id.get(r.jam_kerja_id)
         roster_map.setdefault(uid_str, {})[d_str] = {
@@ -3363,15 +3485,14 @@ def get_roster_matrix(current_user):
 @token_required
 def save_roster_batch(current_user):
     """
-    Menyimpan / menghapus plotting roster untuk banyak sel sekaligus.
-    Body: { "entries": [ { "user_id": 12, "tanggal": "2026-10-28", "jam_kerja_id": 2, "keterangan": "Piket Pagi" }, ... ] }
-    Jika jam_kerja_id == null / 0, maka entry roster pada tanggal tersebut dihapus (kembali ke default shift).
+    Menyimpan / menghapus plotting roster untuk banyak sel sekaligus (ASN & Non-ASN).
     """
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"error": "Akses ditolak."}), 403
 
     data = request.get_json() or {}
     entries = data.get('entries') or []
+    role_hint = (data.get('role') or '').lower()
     if not entries:
         return jsonify({"error": "Daftar entries roster tidak boleh kosong."}), 400
 
@@ -3379,6 +3500,7 @@ def save_roster_batch(current_user):
     deleted = 0
     for item in entries:
         uid = item.get('user_id')
+        item_role = (item.get('role') or role_hint).lower()
         tgl_str = item.get('tanggal')
         raw_shift_id = item.get('jam_kerja_id')
         ket = (item.get('keterangan') or '').strip() or None
@@ -3386,7 +3508,13 @@ def save_roster_batch(current_user):
         if not uid or not tgl_str:
             continue
 
-        target_user = User.query.get(int(uid))
+        if item_role == 'non_asn':
+            target_user = UserNonAsn.query.get(int(uid))
+        elif item_role == 'asn':
+            target_user = UserAsn.query.get(int(uid))
+        else:
+            target_user = UserAsn.query.get(int(uid)) or UserNonAsn.query.get(int(uid))
+
         if not target_user:
             continue
         if current_user.role == 'admin_opd' and target_user.opd_id != current_user.opd_id:
@@ -3397,7 +3525,12 @@ def save_roster_batch(current_user):
         except ValueError:
             continue
 
-        existing = RosterJadwalShift.query.filter_by(user_id=target_user.id, tanggal=tgl).first()
+        is_na = isinstance(target_user, UserNonAsn)
+        if is_na:
+            existing = RosterJadwalShift.query.filter_by(non_asn_id=target_user.id, tanggal=tgl).first()
+        else:
+            existing = RosterJadwalShift.query.filter_by(user_id=target_user.id, tanggal=tgl).first()
+
         if raw_shift_id in (None, '', 'null', 0, '0'):
             if existing:
                 db.session.delete(existing)
@@ -3411,7 +3544,8 @@ def save_roster_batch(current_user):
                 existing.keterangan = ket
             else:
                 db.session.add(RosterJadwalShift(
-                    user_id=target_user.id,
+                    user_id=None if is_na else target_user.id,
+                    non_asn_id=target_user.id if is_na else None,
                     tanggal=tgl,
                     jam_kerja_id=shift.id,
                     keterangan=ket
@@ -3436,7 +3570,6 @@ def save_roster_batch(current_user):
 def swap_roster_shift(current_user):
     """
     Menangani pertukaran jadwal jaga (Tukar Jaga) antara 2 pegawai pada tanggal tertentu.
-    Body: { "user_a_id": 10, "user_b_id": 11, "tanggal": "2026-10-28", "keterangan": "Tukar Jaga" }
     """
     if current_user.role not in ('super_admin', 'admin_opd'):
         return jsonify({"error": "Akses ditolak."}), 403
@@ -3444,12 +3577,13 @@ def swap_roster_shift(current_user):
     data = request.get_json() or {}
     user_a_id = data.get('user_a_id')
     user_b_id = data.get('user_b_id')
+    role_hint = (data.get('role') or '').lower()
     tgl_str = data.get('tanggal')
     catatan = (data.get('keterangan') or '').strip()
 
     if not user_a_id or not user_b_id or not tgl_str:
         return jsonify({"error": "user_a_id, user_b_id, dan tanggal wajib diisi."}), 400
-    if int(user_a_id) == int(user_b_id):
+    if int(user_a_id) == int(user_b_id) and role_hint != '':
         return jsonify({"error": "Pilih dua pegawai yang berbeda untuk tukar jaga."}), 400
 
     try:
@@ -3457,8 +3591,13 @@ def swap_roster_shift(current_user):
     except ValueError:
         return jsonify({"error": "Format tanggal harus YYYY-MM-DD."}), 400
 
-    user_a = User.query.get(int(user_a_id))
-    user_b = User.query.get(int(user_b_id))
+    if role_hint == 'non_asn':
+        user_a = UserNonAsn.query.get(int(user_a_id))
+        user_b = UserNonAsn.query.get(int(user_b_id))
+    else:
+        user_a = UserAsn.query.get(int(user_a_id)) or UserNonAsn.query.get(int(user_a_id))
+        user_b = UserAsn.query.get(int(user_b_id)) or UserNonAsn.query.get(int(user_b_id))
+
     if not user_a or not user_b:
         return jsonify({"error": "Salah satu pegawai tidak ditemukan."}), 404
 
@@ -3475,19 +3614,36 @@ def swap_roster_shift(current_user):
     ket_a = catatan or f"Tukar Jaga dengan {user_b.nama_lengkap}"
     ket_b = catatan or f"Tukar Jaga dengan {user_a.nama_lengkap}"
 
-    roster_a = RosterJadwalShift.query.filter_by(user_id=user_a.id, tanggal=tgl).first()
+    is_a_na = isinstance(user_a, UserNonAsn)
+    is_b_na = isinstance(user_b, UserNonAsn)
+
+    roster_a = (
+        RosterJadwalShift.query.filter_by(non_asn_id=user_a.id, tanggal=tgl).first()
+        if is_a_na else RosterJadwalShift.query.filter_by(user_id=user_a.id, tanggal=tgl).first()
+    )
     if roster_a:
         roster_a.jam_kerja_id = shift_b["id"]
         roster_a.keterangan = ket_a
     else:
-        db.session.add(RosterJadwalShift(user_id=user_a.id, tanggal=tgl, jam_kerja_id=shift_b["id"], keterangan=ket_a))
+        db.session.add(RosterJadwalShift(
+            user_id=None if is_a_na else user_a.id,
+            non_asn_id=user_a.id if is_a_na else None,
+            tanggal=tgl, jam_kerja_id=shift_b["id"], keterangan=ket_a
+        ))
 
-    roster_b = RosterJadwalShift.query.filter_by(user_id=user_b.id, tanggal=tgl).first()
+    roster_b = (
+        RosterJadwalShift.query.filter_by(non_asn_id=user_b.id, tanggal=tgl).first()
+        if is_b_na else RosterJadwalShift.query.filter_by(user_id=user_b.id, tanggal=tgl).first()
+    )
     if roster_b:
         roster_b.jam_kerja_id = shift_a["id"]
         roster_b.keterangan = ket_b
     else:
-        db.session.add(RosterJadwalShift(user_id=user_b.id, tanggal=tgl, jam_kerja_id=shift_a["id"], keterangan=ket_b))
+        db.session.add(RosterJadwalShift(
+            user_id=None if is_b_na else user_b.id,
+            non_asn_id=user_b.id if is_b_na else None,
+            tanggal=tgl, jam_kerja_id=shift_a["id"], keterangan=ket_b
+        ))
 
     db.session.commit()
     catat_audit(
@@ -3498,3 +3654,386 @@ def swap_roster_shift(current_user):
     return jsonify({
         "message": f"Tukar jaga tanggal {tgl_str} antara {user_a.nama_lengkap} dan {user_b.nama_lengkap} berhasil disimpan."
     }), 200
+
+
+# SPOT synchronization and cron management endpoints (Super Admin only for configuration & queue console)
+@api_blueprint.route('/spot/status', methods=['GET'])
+@token_required
+def get_spot_sync_status(current_user):
+    if current_user.role != 'super_admin':
+        return jsonify({"error": "Akses khusus Super Admin."}), 403
+
+    from api.spot_sync import get_spot_config
+
+    cfg = get_spot_config()
+    total_cnt = PresensiAsn.query.count()
+    synced_cnt = PresensiAsn.query.filter_by(spot_sync_status='synced').count()
+    pending_cnt = PresensiAsn.query.filter_by(spot_sync_status='pending').count()
+    failed_cnt = PresensiAsn.query.filter_by(spot_sync_status='failed').count()
+
+    devices = [
+        {"sn": d.sn, "name": d.name or d.device_name or d.sn, "verified": bool(d.verified)}
+        for d in Device.query.all()
+    ]
+
+    return jsonify({
+        "config": cfg,
+        "summary": {
+            "total": total_cnt,
+            "synced": synced_cnt,
+            "pending": pending_cnt,
+            "failed": failed_cnt,
+        },
+        "devices": devices,
+    }), 200
+
+
+@api_blueprint.route('/spot/config', methods=['PUT'])
+@token_required
+def update_spot_sync_config(current_user):
+    if current_user.role != 'super_admin':
+        return jsonify({"error": "Akses khusus Super Admin."}), 403
+
+    from api.spot_sync import update_spot_config
+
+    data = request.get_json(silent=True) or {}
+    updated = update_spot_config(data)
+    catat_audit(
+        current_user.id,
+        'UPDATE_SPOT_CONFIG',
+        'app_settings',
+        f"Memperbarui konfigurasi SPOT (URL: {updated['spot_base_url']}, Interval Cron: {updated['spot_cron_interval_minutes']} menit)",
+        target_record_id='SPOT_CONFIG',
+    )
+    return jsonify({
+        "message": "Konfigurasi sinkronisasi SPOT berhasil disimpan.",
+        "config": updated,
+    }), 200
+
+
+@api_blueprint.route('/spot/logs', methods=['GET'])
+@token_required
+def get_spot_sync_logs(current_user):
+    if current_user.role != 'super_admin':
+        return jsonify({"error": "Akses khusus Super Admin."}), 403
+
+    from api.spot_sync import get_spot_config, format_attlog_line
+
+    cfg = get_spot_config()
+    status_filter = request.args.get('status', '', type=str).strip().lower()
+    start_date_str = request.args.get('start_date', '', type=str).strip()
+    end_date_str = request.args.get('end_date', '', type=str).strip()
+    search = request.args.get('search', '', type=str).strip()
+    page = max(1, request.args.get('page', 1, type=int))
+    limit = min(max(1, request.args.get('limit', 25, type=int)), 200)
+
+    q = PresensiAsn.query
+    if status_filter in ('pending', 'synced', 'failed'):
+        q = q.filter(PresensiAsn.spot_sync_status == status_filter)
+    if start_date_str:
+        try:
+            q = q.filter(PresensiAsn.tanggal_tugas >= datetime.strptime(start_date_str, '%Y-%m-%d').date())
+        except ValueError:
+            pass
+    if end_date_str:
+        try:
+            q = q.filter(PresensiAsn.tanggal_tugas <= datetime.strptime(end_date_str, '%Y-%m-%d').date())
+        except ValueError:
+            pass
+    if search:
+        q = q.filter(
+            db.or_(
+                PresensiAsn.nama_lengkap.ilike(f'%{search}%'),
+                PresensiAsn.nip.ilike(f'%{search}%'),
+                PresensiAsn.user_pin.ilike(f'%{search}%'),
+                PresensiAsn.device_sn.ilike(f'%{search}%'),
+            )
+        )
+
+    total_records = q.count()
+    total_pages = max(1, math.ceil(total_records / limit))
+    safe_page = min(page, total_pages)
+    rows = (
+        q.order_by(PresensiAsn.waktu_scan.desc())
+        .offset((safe_page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+
+    opds_by_id = {o.id: o.nama_opd for o in MasterOpd.query.all()}
+    data = []
+    for r in rows:
+        data.append({
+            "log_id": r.log_id,
+            "nip": r.nip,
+            "user_pin": r.user_pin,
+            "nama_lengkap": r.nama_lengkap,
+            "opd_id": r.opd_id,
+            "nama_opd": opds_by_id.get(r.opd_id) or "-",
+            "tanggal_tugas": r.tanggal_tugas.strftime("%Y-%m-%d") if r.tanggal_tugas else None,
+            "waktu_scan": r.waktu_scan.strftime("%Y-%m-%d %H:%M:%S") if r.waktu_scan else None,
+            "tipe_absen": r.tipe_absen,
+            "status_kehadiran": r.status_kehadiran,
+            "device_sn": r.device_sn,
+            "payload": format_attlog_line(r, config=cfg),
+            "spot_sync_status": r.spot_sync_status,
+            "spot_synced_at": r.spot_synced_at.strftime("%Y-%m-%d %H:%M:%S") if r.spot_synced_at else None,
+            "spot_response": r.spot_response,
+        })
+
+    return jsonify({
+        "data": data,
+        "total_records": total_records,
+        "total_pages": total_pages,
+        "current_page": safe_page,
+    }), 200
+
+
+@api_blueprint.route('/spot/handshake-devices', methods=['POST'])
+@token_required
+def handshake_all_spot_devices(current_user):
+    if current_user.role != 'super_admin':
+        return jsonify({"error": "Akses khusus Super Admin."}), 403
+
+    from api.spot_sync import get_spot_config, handshake_spot_device
+
+    cfg = get_spot_config()
+    data = request.get_json(silent=True) or {}
+    base_url = (data.get('base_url') or cfg['spot_base_url']).strip()
+
+    sns = [d.sn for d in Device.query.all() if d.sn]
+    override_sn = cfg.get('spot_override_sn')
+    if override_sn and override_sn not in sns:
+        sns.insert(0, override_sn)
+
+    results = []
+    success_count = 0
+    failed_count = 0
+    for sn in sns:
+        res = handshake_spot_device(sn, base_url=base_url)
+        if res.get('ok'):
+            success_count += 1
+        else:
+            failed_count += 1
+        results.append(res)
+
+    catat_audit(
+        current_user.id,
+        'SPOT_HANDSHAKE_DEVICES',
+        'devices',
+        f"Handshake {len(sns)} perangkat Kiosk ke server SPOT ({base_url}): {success_count} berhasil, {failed_count} gagal",
+        target_record_id=str(len(sns)),
+    )
+    return jsonify({
+        "message": f"Handshake perangkat ke SPOT selesai: {success_count} berhasil, {failed_count} gagal.",
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "results": results,
+    }), 200
+
+
+@api_blueprint.route('/spot/sync-pending', methods=['POST'])
+@token_required
+def sync_pending_spot_logs(current_user):
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    from api.spot_sync import sync_pending_batch
+
+    data = request.get_json(silent=True) or {}
+    base_url = (data.get('base_url') or '').strip() or None
+    limit = min(int(data.get('limit') or 100), 500)
+    include_failed = data.get('include_failed', True)
+    opd_id = current_user.opd_id if current_user.role == 'admin_opd' else data.get('opd_id')
+
+    batch_res = sync_pending_batch(
+        limit=limit,
+        opd_id=opd_id,
+        include_failed=bool(include_failed),
+        base_url=base_url,
+        trigger_source='manual',
+        commit=True,
+    )
+    if batch_res.get('locked'):
+        return jsonify(batch_res), 409
+
+    catat_audit(
+        current_user.id,
+        'SPOT_SYNC_BATCH',
+        'presensi_asn',
+        batch_res.get('summary') or batch_res.get('message'),
+        target_record_id=str(batch_res.get('synced_count', 0)),
+    )
+    return jsonify(batch_res), 200
+
+
+@api_blueprint.route('/spot/test-push', methods=['POST'])
+@token_required
+def test_push_spot_single(current_user):
+    if current_user.role not in ('super_admin', 'admin_opd'):
+        return jsonify({"error": "Akses ditolak."}), 403
+
+    from api.spot_sync import push_attlog_to_spot, get_spot_config
+
+    cfg = get_spot_config()
+    data = request.get_json(silent=True) or {}
+    log_id = data.get('log_id')
+    base_url = (data.get('base_url') or cfg['spot_base_url']).strip()
+
+    if log_id:
+        row = PresensiAsn.query.get(int(log_id))
+    else:
+        row = PresensiAsn.query.order_by(PresensiAsn.waktu_scan.desc()).first()
+
+    if not row:
+        return jsonify({"error": "Data log presensi_asn tidak ditemukan."}), 404
+
+    if current_user.role == 'admin_opd' and row.opd_id != current_user.opd_id:
+        return jsonify({"error": "Akses ditolak untuk log instansi lain."}), 403
+
+    res = push_attlog_to_spot(row, base_url=base_url, commit=True, config=cfg)
+    return jsonify(res), 200
+
+
+@api_blueprint.route('/spot/sync-pegawai-csv', methods=['POST'])
+@token_required
+def sync_pegawai_from_spot_csv(current_user):
+    if current_user.role != 'super_admin':
+        return jsonify({"error": "Akses khusus Super Admin."}), 403
+
+    if 'file' not in request.files:
+        return jsonify({"error": "File CSV data pegawai wajib diunggah."}), 400
+
+    file_obj = request.files['file']
+    filename = (file_obj.filename or '').lower()
+    if not filename.endswith('.csv'):
+        return jsonify({"error": "Format file harus .csv dari ekspor SPOT."}), 400
+
+    raw_bytes = file_obj.read()
+    try:
+        raw_text = raw_bytes.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raw_text = raw_bytes.decode('latin-1', errors='replace')
+
+    from api.spot_sync import parse_spot_pegawai_csv, sync_pegawai_records_to_db
+
+    records = parse_spot_pegawai_csv(raw_text)
+    if not records:
+        return jsonify({"error": "Tidak ada baris pegawai valid (nip, nama, pin) di file CSV."}), 400
+
+    summary = sync_pegawai_records_to_db(records)
+    catat_audit(
+        current_user.id,
+        'SYNC_PEGAWAI_CSV',
+        'data_pegawai',
+        (
+            f"Sinkronisasi CSV SPOT ({summary['total_csv_rows']} baris): "
+            f"+{summary['inserted_data_pegawai']} pegawai baru, "
+            f"{summary['updated_pins']} PIN diperbarui, "
+            f"{summary['synced_users_asn']} users_asn & {summary['synced_presensi_asn']} log disinkronkan"
+        ),
+        target_record_id=str(summary['total_csv_rows']),
+    )
+    return jsonify({
+        "message": (
+            f"Sinkronisasi selesai: {summary['inserted_data_pegawai']} ASN baru ditambahkan, "
+            f"{summary['updated_pins']} PIN diperbarui, {summary['synced_users_asn']} akun ASN & "
+            f"{summary['synced_presensi_asn']} log diselaraskan."
+        ),
+        **summary,
+    }), 200
+
+
+@api_blueprint.route('/manage-asn/migrate-to-non-asn', methods=['POST'])
+@token_required
+def migrate_misclassified_asn_to_non_asn(current_user):
+    """Pindahkan pegawai salah kamar dari users_asn ke users_non_asn beserta folder biometrik dan log-nya."""
+    if current_user.role != 'super_admin':
+        return jsonify({"error": "Akses khusus Super Admin."}), 403
+
+    data = request.get_json(silent=True) or {}
+    old_nip = str(data.get('nip') or '').strip()
+    target_nik = str(data.get('nik') or '').strip()
+    if not old_nip or len(target_nik) != 16 or not target_nik.isdigit():
+        return jsonify({"error": "NIP sumber dan NIK tujuan (16 digit angka) wajib diisi."}), 400
+
+    asn_user = UserAsn.query.filter_by(nip=old_nip).first()
+    if not asn_user:
+        return jsonify({"error": f"Pegawai ASN dengan NIP '{old_nip}' tidak ditemukan."}), 404
+    if asn_user.role != 'asn':
+        return jsonify({"error": "Akun bertipe admin/operator tidak boleh dipindahkan langsung; gunakan pemisahan akun admin."}), 400
+    if UserNonAsn.query.filter_by(nik=target_nik).first():
+        return jsonify({"error": f"NIK '{target_nik}' sudah terdaftar di users_non_asn."}), 409
+
+    eff_opd_id = asn_user.opd_id or 1
+    non_asn = UserNonAsn(
+        nik=target_nik,
+        nama_lengkap=asn_user.nama_lengkap,
+        opd_id=eff_opd_id,
+        jam_kerja_id=asn_user.jam_kerja_id,
+        is_face_registered=asn_user.is_face_registered,
+        approval_status=asn_user.approval_status,
+        created_at=asn_user.created_at,
+    )
+    db.session.add(non_asn)
+    db.session.flush()
+
+    moved_logs = 0
+    for pa in PresensiAsn.query.filter_by(user_id=asn_user.id).all():
+        db.session.add(PresensiNonAsn(
+            non_asn_id=non_asn.id,
+            nik=target_nik,
+            nama_lengkap=pa.nama_lengkap,
+            opd_id=pa.opd_id or eff_opd_id,
+            jam_kerja_id=pa.jam_kerja_id,
+            tanggal_tugas=pa.tanggal_tugas,
+            waktu_scan=pa.waktu_scan,
+            tipe_absen=pa.tipe_absen,
+            status_kehadiran=pa.status_kehadiran,
+            keterlambatan_menit=pa.keterlambatan_menit,
+            device_sn=pa.device_sn,
+            foto_presensi=pa.foto_presensi,
+        ))
+        db.session.delete(pa)
+        moved_logs += 1
+
+    RosterJadwalShift.query.filter_by(user_id=asn_user.id).update(
+        {"non_asn_id": non_asn.id, "user_id": None}
+    )
+    UserAksesOpd.query.filter_by(user_nip=old_nip).delete()
+    db.session.delete(asn_user)
+    db.session.commit()
+
+    base_dir = os.getcwd()
+    for folder in ("samples", "samples_embedding"):
+        old_p = os.path.join(base_dir, folder, old_nip)
+        new_p = os.path.join(base_dir, folder, target_nik)
+        if os.path.exists(old_p) and not os.path.exists(new_p):
+            os.rename(old_p, new_p)
+            if folder == "samples_embedding":
+                old_pkl = os.path.join(new_p, f"{old_nip}.pkl")
+                new_pkl = os.path.join(new_p, f"{target_nik}.pkl")
+                old_txt = os.path.join(new_p, f"{old_nip}.txt")
+                new_txt = os.path.join(new_p, f"{target_nik}.txt")
+                if os.path.exists(old_pkl) and not os.path.exists(new_pkl):
+                    os.rename(old_pkl, new_pkl)
+                if os.path.exists(old_txt):
+                    os.remove(old_txt)
+                with open(new_txt, "w", encoding="utf-8") as tf:
+                    tf.write(f"[{target_nik}, {non_asn.nama_lengkap}]\n")
+
+    catat_audit(
+        current_user.id,
+        'MIGRATE_ASN_TO_NON_ASN',
+        'users_non_asn',
+        f"Memindahkan '{non_asn.nama_lengkap}' ({old_nip} -> NIK {target_nik}) beserta {moved_logs} log presensi ke Non-ASN",
+        target_record_id=target_nik,
+    )
+    return jsonify({
+        "message": f"Pegawai '{non_asn.nama_lengkap}' berhasil dipindahkan ke Data Non-ASN (NIK {target_nik}) beserta {moved_logs} log presensi.",
+        "non_asn_id": non_asn.id,
+        "nik": target_nik,
+        "moved_logs": moved_logs,
+    }), 200
+
+
