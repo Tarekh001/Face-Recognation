@@ -32,14 +32,103 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-ganti-di
 db.init_app(app)
 
 with app.app_context():
-    # db.create_all()  # Dimatikan karena pakai skema SQL manual via DBeaver
+    try:
+        from sqlalchemy import text
+        db.session.execute(text("""
+            CREATE TABLE IF NOT EXISTS master_jam_kerja (
+                id SERIAL PRIMARY KEY,
+                nama_shift VARCHAR(100) NOT NULL,
+                jam_masuk TIME NOT NULL,
+                jam_pulang TIME NOT NULL,
+                mulai_scan_masuk TIME NOT NULL,
+                akhir_scan_masuk TIME NOT NULL,
+                mulai_scan_pulang TIME NOT NULL,
+                akhir_scan_pulang TIME NOT NULL,
+                menit_toleransi INTEGER DEFAULT 0,
+                is_lintas_hari BOOLEAN DEFAULT FALSE,
+                abaikan_libur BOOLEAN DEFAULT FALSE,
+                opd_id INTEGER REFERENCES master_opd(id) ON DELETE SET NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+        db.session.commit()
+
+        # Auto-seed default MasterJamKerja profiles if empty
+        from models import MasterJamKerja
+        from datetime import time as time_type
+        if MasterJamKerja.query.count() == 0:
+            default_shifts = [
+                MasterJamKerja(
+                    nama_shift="Reguler ASN (5 Hari Kerja)",
+                    jam_masuk=time_type(7, 30),
+                    jam_pulang=time_type(16, 0),
+                    mulai_scan_masuk=time_type(6, 0),
+                    akhir_scan_masuk=time_type(12, 0),
+                    mulai_scan_pulang=time_type(15, 0),
+                    akhir_scan_pulang=time_type(20, 0),
+                    menit_toleransi=30,
+                    is_lintas_hari=False,
+                    abaikan_libur=False,
+                    opd_id=None,
+                ),
+                MasterJamKerja(
+                    nama_shift="Shift Pagi Operasional",
+                    jam_masuk=time_type(7, 0),
+                    jam_pulang=time_type(15, 0),
+                    mulai_scan_masuk=time_type(5, 30),
+                    akhir_scan_masuk=time_type(10, 0),
+                    mulai_scan_pulang=time_type(14, 0),
+                    akhir_scan_pulang=time_type(18, 0),
+                    menit_toleransi=15,
+                    is_lintas_hari=False,
+                    abaikan_libur=True,
+                    opd_id=None,
+                ),
+                MasterJamKerja(
+                    nama_shift="Shift Siang Operasional",
+                    jam_masuk=time_type(14, 0),
+                    jam_pulang=time_type(22, 0),
+                    mulai_scan_masuk=time_type(12, 30),
+                    akhir_scan_masuk=time_type(17, 0),
+                    mulai_scan_pulang=time_type(21, 0),
+                    akhir_scan_pulang=time_type(23, 59),
+                    menit_toleransi=15,
+                    is_lintas_hari=False,
+                    abaikan_libur=True,
+                    opd_id=None,
+                ),
+                MasterJamKerja(
+                    nama_shift="Shift Malam (Lintas Hari)",
+                    jam_masuk=time_type(21, 0),
+                    jam_pulang=time_type(6, 0),
+                    mulai_scan_masuk=time_type(19, 30),
+                    akhir_scan_masuk=time_type(23, 59),
+                    mulai_scan_pulang=time_type(5, 0),
+                    akhir_scan_pulang=time_type(9, 0),
+                    menit_toleransi=15,
+                    is_lintas_hari=True,
+                    abaikan_libur=True,
+                    opd_id=None,
+                ),
+            ]
+            db.session.add_all(default_shifts)
+            db.session.commit()
+            print("✅ [Schema] 4 Profil Master Jam Kerja default berhasil di-seed.")
+    except Exception as _schema_err:
+        db.session.rollback()
+        print(f"⚠️ [Schema] Peringatan migrasi skema: {_schema_err}")
+    try:
+        from api.spot_sync import ensure_spot_settings_seeded
+        ensure_spot_settings_seeded()
+    except Exception:
+        db.session.rollback()
     print(f"Database PostgreSQL ({_db_host}:{_db_port}/{_db_name}) berhasil terhubung")
 
-# =======================================================
-# INI ADALAH BARIS YANG KEMUNGKINAN BESAR HILANG:
-# Baris ini berfungsi mendaftarkan semua rute di routes.py
-# =======================================================
 app.register_blueprint(api_blueprint, url_prefix="/api")
+
+if os.environ.get("SPOT_DISABLE_SCHEDULER", "").lower() not in ("1", "true"):
+    from api.spot_scheduler import start_spot_cron_scheduler
+    start_spot_cron_scheduler(app)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

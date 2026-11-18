@@ -21,9 +21,12 @@ samples_embedding/*
 .agents/
 .tools/
 .docs/
+graphify-out/
+scratch/
 migrations/
 
 # 5. File Temporary & Log
+static/
 temp/
 *.log
 
