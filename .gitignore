@@ -23,7 +23,8 @@ samples_embedding/*
 .docs/
 graphify-out/
 scratch/
-migrations/
+.superpowers/
+migrations/dump-*.sql
 
 # 5. File Temporary & Log
 static/
