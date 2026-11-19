@@ -1,5 +1,16 @@
 import os
 import warnings
+from pathlib import Path
+
+# Muat file .env secara otomatis jika tersedia di direktori root proyek
+_env_path = Path(__file__).resolve().parent / ".env"
+if _env_path.exists():
+    for _raw in _env_path.read_text(encoding="utf-8").splitlines():
+        _line = _raw.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 from flask import Flask
 from flask_cors import CORS
 from api.routes import api_blueprint
@@ -131,4 +142,5 @@ if os.environ.get("SPOT_DISABLE_SCHEDULER", "").lower() not in ("1", "true"):
     start_spot_cron_scheduler(app)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    _debug_mode = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=_debug_mode, use_reloader=False)
